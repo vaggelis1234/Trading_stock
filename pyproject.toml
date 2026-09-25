@@ -1,0 +1,23 @@
+[tool.poetry]
+name = "trade_stocks"
+version = "0.1.0"
+description = "Conservative paper trading platform for stocks"
+authors = ["Vaggelis <noreply@example.com>"]
+license = "MIT"
+
+[tool.poetry.dependencies]
+python = "^3.10"
+pandas = "^2.0"
+numpy = "^1.25"
+pyyaml = "^6.0"
+requests = "^2.31"
+yfinance = "^0.2.22"
+alpaca-trade-api = "^6.0.0"
+
+[tool.poetry.dev-dependencies]
+pytest = "^7.4"
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"
+
