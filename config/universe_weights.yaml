@@ -1,0 +1,7 @@
+# Universe v1 factor weights. They must sum to 1.
+# The score ranks symbols that already passed every hard veto.
+# It is a ranking input only. The universe pipeline does not place orders.
+trend: 0.30
+momentum: 0.30
+volatility_risk: 0.20
+volume_liquidity: 0.20

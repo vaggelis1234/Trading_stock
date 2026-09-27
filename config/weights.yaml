@@ -1,0 +1,13 @@
+mom_1h: 1.0
+mom_24h: 0.8
+ma_cross: 0.7
+volatility: -0.5
+adv: 0.5
+vol_spike: 0.6
+rsi: -0.3
+macd_hist: 0.9
+dist_high: 0.4
+earnings_proximity: -0.7
+news_sentiment: 0.8
+short_interest: -0.4
+
