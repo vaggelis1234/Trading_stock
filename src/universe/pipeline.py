@@ -12,10 +12,11 @@ from typing import Optional
 
 import pandas as pd
 
+from src.data.bar_store import BarStore, bars_db_path
 from src.data.provider import YFinanceMarketDataProvider, prepare_ohlcv
 from src.persistence.store import save_universe_snapshots
 from src.universe.earnings import UnavailableEarningsProvider, earnings_within_48h
-from src.universe.metrics import compute_symbol_metrics, to_utc_iso
+from src.universe.metrics import compute_symbol_metrics, metrics_as_of, precompute_symbol_metrics, to_utc_iso
 from src.universe.ranking import rank_snapshots
 from src.universe.scoring import apply_score, load_universe_weights
 from src.universe.veto import apply_hard_vetoes
@@ -56,9 +57,8 @@ def common_timestamps(hourly_by_symbol: dict, lookback: int) -> list[pd.Timestam
     return list(clock)
 
 
-def evaluate_symbol(symbol: str, daily: pd.DataFrame, hourly: pd.DataFrame, as_of, earnings_flag: Optional[bool], weights: dict) -> dict:
-    """Metrics, veto, and score for one symbol at one timestamp."""
-    metrics = compute_symbol_metrics(daily, hourly, as_of)
+def _scored_row(symbol: str, as_of, metrics: dict, earnings_flag: Optional[bool], weights: dict) -> dict:
+    """Veto and score for metrics already sampled at ``as_of``."""
     veto = apply_hard_vetoes(
         daily_close=metrics["daily_close"],
         daily_ema200=metrics["daily_ema200"],
@@ -87,6 +87,11 @@ def evaluate_symbol(symbol: str, daily: pd.DataFrame, hourly: pd.DataFrame, as_o
         **EMPTY_SCORES,
     }
     return apply_score(row, weights)
+
+
+def evaluate_symbol(symbol: str, daily: pd.DataFrame, hourly: pd.DataFrame, as_of, earnings_flag: Optional[bool], weights: dict) -> dict:
+    """Metrics, veto, and score for one symbol at one timestamp."""
+    return _scored_row(symbol, as_of, compute_symbol_metrics(daily, hourly, as_of), earnings_flag, weights)
 
 
 def _insufficient_row(symbol: str, as_of, earnings_flag: Optional[bool]) -> dict:
@@ -145,6 +150,7 @@ def run_universe(
     provider=None,
     earnings=None,
     db_path: str = "artifacts/universe.db",
+    bars_db: Optional[str] = None,
     artifact_dir: str = "artifacts",
     lookback_bars: int = 24,
     daily_lookback_days: int = 520,
@@ -165,16 +171,26 @@ def run_universe(
     hourly_start = (end - pd.Timedelta(days=hourly_lookback_days)).strftime("%Y-%m-%d")
     end_text = end.strftime("%Y-%m-%d")
 
+    bars = BarStore(bars_db_path(bars_db))
     daily_map = {}
     hourly_map = {}
     for symbol in symbols:
         try:
-            daily_map[symbol] = prepare_ohlcv(provider.get_bars(symbol, daily_start, end_text, "1d"))
-            hourly_map[symbol] = prepare_ohlcv(provider.get_bars(symbol, hourly_start, end_text, "1h"))
+            daily_map[symbol] = bars.sync_and_load(provider, symbol, "1d", daily_start, end_text, clock)
+            hourly_map[symbol] = bars.sync_and_load(provider, symbol, "1h", hourly_start, end_text, clock)
         except Exception:
-            logger.exception("market data fetch failed for %s", symbol)
+            logger.exception("market data sync failed for %s", symbol)
             daily_map[symbol] = prepare_ohlcv(None)
             hourly_map[symbol] = prepare_ohlcv(None)
+    logger.info(
+        "bar sync initialized=%s backfilled=%s refreshed=%s skipped=%s failed=%s rebuilt=%s",
+        bars.actions["initialized"],
+        bars.actions["backfilled"],
+        bars.actions["refreshed"],
+        bars.actions["skipped"],
+        bars.actions["failed"],
+        bars.actions["rebuilt"],
+    )
 
     timestamps = common_timestamps(hourly_map, lookback_bars)
     if not timestamps:
@@ -185,16 +201,19 @@ def run_universe(
         hourly = hourly_map[symbol]
         daily = daily_map[symbol]
         symbol_times = timestamps if len(hourly) else [timestamps[-1]]
+        prepared = None
+        if len(hourly) or len(daily):
+            prepared = precompute_symbol_metrics(daily, hourly)
         for as_of in symbol_times:
             try:
                 flag = earnings_within_48h(earnings, symbol, as_of)
             except Exception:
                 logger.exception("earnings lookup failed for %s", symbol)
                 flag = None
-            if len(hourly) == 0 and len(daily) == 0:
+            if prepared is None:
                 grouped[as_of].append(_insufficient_row(symbol, as_of, flag))
                 continue
-            grouped[as_of].append(evaluate_symbol(symbol, daily, hourly, as_of, flag, weights))
+            grouped[as_of].append(_scored_row(symbol, as_of, metrics_as_of(prepared, as_of), flag, weights))
 
     latest: list[dict] = []
     for as_of in timestamps:
@@ -204,7 +223,14 @@ def run_universe(
         save_universe_snapshots(ranked, db_path)
         latest = ranked
         passed = sum(1 for row in ranked if row["veto_status"] == "PASS")
-        logger.info("universe snapshot %s pass=%s blocked=%s", ranked[0]["scan_timestamp"], passed, len(ranked) - passed)
+        scored = sum(1 for row in ranked if row.get("final_score") is not None)
+        logger.info(
+            "universe snapshot %s pass=%s blocked=%s scored=%s",
+            ranked[0]["scan_timestamp"],
+            passed,
+            len(ranked) - passed,
+            scored,
+        )
 
     _export_latest(latest, artifact_dir)
     return latest

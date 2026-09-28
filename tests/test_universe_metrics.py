@@ -4,7 +4,13 @@ import pytest
 
 from src.data.provider import prepare_ohlcv
 from src.features.indicators import atr, avg_dollar_volume, ema, macd_hist, rsi, volume_ratio
-from src.universe.metrics import completed_daily, compute_symbol_metrics
+from src.universe.metrics import (
+    HOURLY_STALE_AFTER,
+    completed_daily,
+    compute_symbol_metrics,
+    metrics_as_of,
+    precompute_symbol_metrics,
+)
 
 
 def _cutler_rsi(closes, window=14):
@@ -171,3 +177,104 @@ def test_stale_hourly_bars_are_not_reported_as_current():
     assert metrics["hourly_close"] is None
     assert metrics["daily_close"] == pytest.approx(50.0)
     assert metrics["adv20"] == pytest.approx(50.0 * 100_000.0)
+
+
+def _prefix_metrics(daily, hourly, as_of):
+    """Causal prefix definition, independent of the precomputed series."""
+    as_of_ts = pd.Timestamp(as_of)
+    if as_of_ts.tzinfo is None:
+        as_of_ts = as_of_ts.tz_localize("UTC")
+    else:
+        as_of_ts = as_of_ts.tz_convert("UTC")
+    as_of_ts = as_of_ts.floor("min")
+    hourly_frame = prepare_ohlcv(hourly)
+    daily_frame = prepare_ohlcv(daily)
+    expected = {
+        "hourly_close": None,
+        "daily_close": None,
+        "daily_ema200": None,
+        "rsi14": None,
+        "macd_hist": None,
+        "atr14": None,
+        "atr_percent": None,
+        "volume": None,
+        "volume_ratio": None,
+        "adv20": None,
+    }
+    hourly_hist = hourly_frame.loc[:as_of_ts] if not hourly_frame.empty else hourly_frame
+    if not hourly_hist.empty and as_of_ts - hourly_hist.index[-1] <= HOURLY_STALE_AFTER:
+        close = float(hourly_hist["close"].iloc[-1])
+        expected["hourly_close"] = None if close <= 0 else close
+        expected["volume"] = float(hourly_hist["volume"].iloc[-1])
+        expected["rsi14"] = float(rsi(hourly_hist, 14).iloc[-1])
+        expected["macd_hist"] = float(macd_hist(hourly_hist).iloc[-1])
+        atr14 = float(atr(hourly_hist, 14).iloc[-1])
+        expected["atr14"] = atr14
+        if expected["hourly_close"] not in (None, 0):
+            expected["atr_percent"] = atr14 / expected["hourly_close"]
+        expected["volume_ratio"] = float(volume_ratio(hourly_hist, 20).iloc[-1])
+    daily_hist = completed_daily(daily_frame, as_of_ts)
+    if not daily_hist.empty:
+        expected["daily_close"] = float(daily_hist["close"].iloc[-1])
+        if len(daily_hist) >= 200:
+            expected["daily_ema200"] = float(ema(daily_hist["close"], 200).iloc[-1])
+        if len(daily_hist) >= 20:
+            expected["adv20"] = float(avg_dollar_volume(daily_hist, 20).iloc[-1])
+    return expected
+
+
+def test_reused_indicator_series_matches_the_causal_prefix():
+    daily_idx = pd.bdate_range("2023-01-02", periods=210, tz="America/New_York")
+    daily_close = [100.0 + (i % 7) * 0.3 for i in range(210)]
+    daily = pd.DataFrame(
+        {
+            "open": daily_close,
+            "high": [price + 0.4 for price in daily_close],
+            "low": [price - 0.4 for price in daily_close],
+            "close": daily_close,
+            "volume": [1_000_000.0 + (i % 4) * 10_000.0 for i in range(210)],
+        },
+        index=daily_idx,
+    )
+    as_of = (daily_idx[-1] + pd.Timedelta(hours=16)).tz_convert("UTC").floor("min")
+    hourly_idx = pd.date_range(as_of - pd.Timedelta(hours=79), periods=80, freq="h", tz="UTC")
+    hourly_close = [120.0 + ((i % 5) - 2) * 0.25 for i in range(80)]
+    hourly = pd.DataFrame(
+        {
+            "open": hourly_close,
+            "high": [price + 0.2 for price in hourly_close],
+            "low": [price - 0.2 for price in hourly_close],
+            "close": hourly_close,
+            "volume": [10_000.0 + (i % 9) * 100.0 for i in range(80)],
+        },
+        index=hourly_idx,
+    )
+    gap_stamp = hourly_idx[24]
+    hourly = hourly.drop(hourly.index[20:28])
+    zero_at = hourly.index[10]
+    hourly.loc[zero_at, "close"] = 0.0
+
+    prepared = precompute_symbol_metrics(prepare_ohlcv(daily), prepare_ohlcv(hourly))
+    stamps = list(hourly.index[-30:])
+    stamps.append(hourly.index[-1] + pd.Timedelta(minutes=30))
+    stamps.append(hourly.index[-1] + HOURLY_STALE_AFTER)
+    stamps.append(hourly.index[-1] + HOURLY_STALE_AFTER + pd.Timedelta(minutes=1))
+    stamps.append(gap_stamp)
+    for stamp in stamps:
+        sampled = metrics_as_of(prepared, stamp)
+        direct = compute_symbol_metrics(daily, hourly, stamp)
+        expected = _prefix_metrics(daily, hourly, stamp)
+        for key, value in expected.items():
+            assert sampled[key] == value, (stamp, key, sampled[key], value)
+            assert direct[key] == value, (stamp, key, direct[key], value)
+    stale = metrics_as_of(prepared, hourly.index[-1] + HOURLY_STALE_AFTER + pd.Timedelta(minutes=1))
+    assert stale["rsi14"] is None
+    assert stale["hourly_close"] is None
+    assert stale["daily_close"] is not None
+    gapped = metrics_as_of(prepared, gap_stamp)
+    assert gapped["rsi14"] is None
+    assert gapped["daily_ema200"] is not None
+    zeroed = metrics_as_of(prepared, zero_at)
+    assert zeroed["hourly_close"] is None
+    assert zeroed["atr_percent"] is None
+    assert zeroed["atr14"] is not None

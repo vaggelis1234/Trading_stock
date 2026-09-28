@@ -34,6 +34,7 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--size", type=int, default=None, help="Top N of the S&P 500 universe when --symbols is omitted.")
     parser.add_argument("--lookback", type=int, default=24, help="Hourly bars to snapshot, counting backward from the latest bar.")
     parser.add_argument("--db", default=os.getenv("UNIVERSE_DB", os.path.join("artifacts", "universe.db")))
+    parser.add_argument("--bars-db", default=os.getenv("MARKET_BARS_DB", os.path.join("artifacts", "market_bars.db")))
     parser.add_argument("--artifact-dir", default=os.getenv("ARTIFACT_DIR", "artifacts"))
     args = parser.parse_args(argv)
 
@@ -41,6 +42,7 @@ def main(argv: list[str] | None = None) -> None:
     rows = run_universe(
         symbols,
         db_path=args.db,
+        bars_db=args.bars_db,
         artifact_dir=args.artifact_dir,
         lookback_bars=args.lookback,
     )

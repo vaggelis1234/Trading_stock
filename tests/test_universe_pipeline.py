@@ -51,7 +51,7 @@ def _frames(direction):
         },
         index=hourly_idx,
     )
-    return daily, hourly
+    return daily, hourly, as_of
 
 
 def test_common_timestamps_use_the_shared_clock():
@@ -65,8 +65,8 @@ def test_common_timestamps_use_the_shared_clock():
 
 
 def test_scan_persists_history_and_does_not_overwrite(tmp_path):
-    up_daily, up_hourly = _frames("up")
-    down_daily, down_hourly = _frames("down")
+    up_daily, up_hourly, as_of = _frames("up")
+    down_daily, down_hourly, _as_of = _frames("down")
     provider = MapProvider(
         {"UP": up_daily, "DOWN": down_daily},
         {"UP": up_hourly, "DOWN": down_hourly},
@@ -79,6 +79,7 @@ def test_scan_persists_history_and_does_not_overwrite(tmp_path):
         db_path=str(db),
         artifact_dir=str(artifacts),
         lookback_bars=24,
+        now=as_of,
     )
     by_symbol = {row["symbol"]: row for row in rows}
     assert by_symbol["UP"]["veto_status"] == "PASS", by_symbol["UP"]
@@ -100,6 +101,7 @@ def test_scan_persists_history_and_does_not_overwrite(tmp_path):
         db_path=str(db),
         artifact_dir=str(artifacts),
         lookback_bars=24,
+        now=as_of,
     )
     assert count_snapshots(str(db)) == 48
 
@@ -112,7 +114,7 @@ def test_scan_persists_history_and_does_not_overwrite(tmp_path):
 
 
 def test_earnings_provider_blocks_and_clears_the_score(tmp_path):
-    daily, hourly = _frames("up")
+    daily, hourly, as_of = _frames("up")
     provider = MapProvider({"AAPL": daily}, {"AAPL": hourly})
     rows = run_universe(
         ["AAPL"],
@@ -121,6 +123,7 @@ def test_earnings_provider_blocks_and_clears_the_score(tmp_path):
         db_path=str(tmp_path / "universe.db"),
         artifact_dir=str(tmp_path / "artifacts"),
         lookback_bars=1,
+        now=as_of,
     )
     assert rows[0]["veto_status"] == "BLOCKED_EARNINGS"
     assert rows[0]["veto_reasons"] == ["BLOCKED_EARNINGS"]
