@@ -90,9 +90,11 @@ def test_scan_persists_history_and_does_not_overwrite(tmp_path):
     assert "BLOCKED_EARNINGS" not in by_symbol["UP"]["veto_reasons"]
     assert by_symbol["DOWN"]["veto_status"] == "BLOCKED_TREND", by_symbol["DOWN"]
     assert "BLOCKED_TREND" in by_symbol["DOWN"]["veto_reasons"]
-    assert by_symbol["DOWN"]["rank"] is None
-    assert by_symbol["DOWN"]["final_score"] is None
-    assert rows[0]["symbol"] == "UP"
+    assert by_symbol["DOWN"]["final_score"] is not None
+    assert by_symbol["DOWN"]["rank"] is not None
+    assert [row["rank"] for row in rows] == [1, 2]
+    assert rows[0]["final_score"] >= rows[1]["final_score"]
+    assert {row["symbol"] for row in rows} == {"UP", "DOWN"}
 
     assert count_snapshots(str(db)) == 48
     run_universe(
@@ -110,10 +112,12 @@ def test_scan_persists_history_and_does_not_overwrite(tmp_path):
     assert history[-1]["veto_status"] == "BLOCKED_TREND"
     assert "BLOCKED_TREND" in history[-1]["veto_reasons"]
     latest = load_latest_scan(str(db))
-    assert [row["symbol"] for row in latest] == ["UP", "DOWN"]
+    assert [row["symbol"] for row in latest] == [row["symbol"] for row in rows]
+    assert latest[0]["rank"] == 1
+    assert latest[1]["final_score"] is not None
 
 
-def test_earnings_provider_blocks_and_clears_the_score(tmp_path):
+def test_earnings_block_keeps_a_score_when_metrics_are_valid(tmp_path):
     daily, hourly, as_of = _frames("up")
     provider = MapProvider({"AAPL": daily}, {"AAPL": hourly})
     rows = run_universe(
@@ -128,8 +132,36 @@ def test_earnings_provider_blocks_and_clears_the_score(tmp_path):
     assert rows[0]["veto_status"] == "BLOCKED_EARNINGS"
     assert rows[0]["veto_reasons"] == ["BLOCKED_EARNINGS"]
     assert rows[0]["earnings_check"] == "within_48h"
-    assert rows[0]["final_score"] is None
-    assert rows[0]["rank"] is None
+    assert rows[0]["final_score"] is not None
+    assert 0.0 <= rows[0]["final_score"] <= 10.0
+    assert rows[0]["rank"] == 1
+
+
+def test_default_pool_is_the_full_sp500_list_not_market_cap(monkeypatch):
+    monkeypatch.setattr("src.data.scan.fetch_sp500_symbols", lambda: ["ZZZ", "AAA", "MMM"])
+
+    def fail_market_cap(*_args, **_kwargs):
+        raise AssertionError("market cap sort must not build the evaluation pool")
+
+    monkeypatch.setattr("src.data.scan.top_n_by_marketcap", fail_market_cap)
+    from src.data.scan import build_sp500_universe
+
+    assert build_sp500_universe() == ["ZZZ", "AAA", "MMM"]
+    assert build_sp500_universe(limit=2) == ["ZZZ", "AAA"]
+
+    monkeypatch.delenv("UNIVERSE_SIZE", raising=False)
+    from scripts.run_universe import resolve_symbols
+    from scripts.scheduler import resolve_symbols as scheduler_symbols
+
+    assert resolve_symbols("", None) == ["ZZZ", "AAA", "MMM"]
+    assert resolve_symbols("msft, aapl", 100) == ["MSFT", "AAPL"]
+    assert resolve_symbols("", 1) == ["ZZZ"]
+    monkeypatch.setenv("UNIVERSE_SIZE", "2")
+    assert resolve_symbols("", None) == ["ZZZ", "AAA"]
+    monkeypatch.delenv("UNIVERSE_SYMBOLS", raising=False)
+    assert scheduler_symbols() == ["ZZZ", "AAA"]
+    monkeypatch.setenv("UNIVERSE_SYMBOLS", "nvda, xom")
+    assert scheduler_symbols() == ["NVDA", "XOM"]
 
 
 def test_yfinance_provider_reuses_existing_fetch(monkeypatch):

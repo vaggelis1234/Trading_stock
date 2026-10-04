@@ -1,4 +1,4 @@
-"""Universe v1 score. Ranking only. Eligible symbols are veto status PASS.
+"""Universe v1 score. Same formulas for every symbol with valid metrics.
 
 Normalization
 -------------
@@ -25,8 +25,10 @@ Volume / liquidity (weight 0.20), equal blend of:
     VolumeRatio: 0 at 0.8, 10 at 2.0, clamped.
     ADV20: 0 at $5,000,000, 10 at 20x that level, on a log10 scale, clamped.
 
-Blocked symbols are not scored. ``apply_score`` clears every score field
-unless veto status is PASS.
+A hard veto does not skip scoring. ``apply_score`` uses these formulas for
+PASS and BLOCKED rows whenever the required inputs are finite. Missing or
+invalid inputs clear every score field. The formulas do not depend on veto
+status.
 """
 
 from pathlib import Path
@@ -145,10 +147,54 @@ def factor_scores(
     }
 
 
+def _finite(value) -> Optional[float]:
+    if value is None:
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(number):
+        return None
+    return number
+
+
+def scoring_inputs_valid(row: Mapping) -> bool:
+    """True when every factor input can be scored without inventing a value."""
+    daily_close = _finite(row.get("daily_close"))
+    daily_ema200 = _finite(row.get("daily_ema200"))
+    hourly_close = _finite(row.get("hourly_close"))
+    rsi14 = _finite(row.get("rsi14"))
+    macd_hist = _finite(row.get("macd_hist"))
+    atr_percent = _finite(row.get("atr_percent"))
+    volume_ratio = _finite(row.get("volume_ratio"))
+    adv20 = _finite(row.get("adv20"))
+    if None in (
+        daily_close,
+        daily_ema200,
+        hourly_close,
+        rsi14,
+        macd_hist,
+        atr_percent,
+        volume_ratio,
+        adv20,
+    ):
+        return False
+    if daily_ema200 == 0.0 or hourly_close == 0.0:
+        return False
+    if atr_percent < 0.0 or volume_ratio < 0.0 or adv20 < 0.0:
+        return False
+    return True
+
+
 def apply_score(row: Mapping, weights: Mapping[str, float]) -> dict:
-    """Score PASS rows. Every other status gets empty score fields."""
+    """Score a row when its metric inputs are valid.
+
+    PASS and BLOCKED rows use the same formulas. Invalid inputs clear the
+    score fields and do not produce a substitute score.
+    """
     scored = dict(row)
-    if scored.get("veto_status") != "PASS":
+    if not scoring_inputs_valid(scored):
         for field in SCORE_FIELDS:
             scored[field] = None
         return scored

@@ -1,6 +1,7 @@
 import json
 import os
 import sqlite3
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
 
@@ -107,8 +108,26 @@ def init_universe_db(path: str = "artifacts/universe.db") -> None:
         """CREATE INDEX IF NOT EXISTS idx_universe_symbol_ts
            ON universe_snapshots(symbol, scan_timestamp)"""
     )
+    _ensure_executed_at(cur)
     conn.commit()
     conn.close()
+
+
+def _ensure_executed_at(cur: sqlite3.Cursor) -> None:
+    """Add the scan-execution clock if this database was created without it.
+
+    ``scan_timestamp`` stays the market-data time. ``executed_at`` is when the
+    scan that wrote the row actually ran.
+    """
+    names = {row[1] for row in cur.execute("PRAGMA table_info(universe_snapshots)")}
+    if names and "executed_at" not in names:
+        cur.execute("ALTER TABLE universe_snapshots ADD COLUMN executed_at TEXT")
+
+
+def _execution_stamp(executed_at: Optional[str]) -> str:
+    if executed_at:
+        return executed_at
+    return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
 
 
 def _reason_text(reasons: Any) -> str:
@@ -117,14 +136,24 @@ def _reason_text(reasons: Any) -> str:
     return json.dumps(list(reasons or []))
 
 
-def save_universe_snapshots(rows: List[Dict[str, Any]], path: str = "artifacts/universe.db") -> int:
-    """Insert snapshots. Existing (scan_timestamp, symbol) rows are left unchanged."""
+def save_universe_snapshots(
+    rows: List[Dict[str, Any]],
+    path: str = "artifacts/universe.db",
+    executed_at: Optional[str] = None,
+) -> int:
+    """Insert snapshots. Existing (scan_timestamp, symbol) rows are left unchanged.
+
+    ``executed_at`` is the wall-clock time of this save. It is never copied
+    from ``scan_timestamp``. Rows written together share one execution time.
+    """
     init_universe_db(path)
     conn = sqlite3.connect(path)
     cur = conn.cursor()
     before = cur.execute("SELECT COUNT(*) FROM universe_snapshots").fetchone()[0]
-    columns = ", ".join(SNAPSHOT_COLUMNS)
-    placeholders = ", ".join(["?"] * len(SNAPSHOT_COLUMNS))
+    stored_columns = SNAPSHOT_COLUMNS + ["executed_at"]
+    columns = ", ".join(stored_columns)
+    placeholders = ", ".join(["?"] * len(stored_columns))
+    execution_stamp = _execution_stamp(executed_at)
     for row in rows:
         values = []
         for column in SNAPSHOT_COLUMNS:
@@ -134,6 +163,7 @@ def save_universe_snapshots(rows: List[Dict[str, Any]], path: str = "artifacts/u
             elif column == "rank" and value is not None:
                 value = int(value)
             values.append(value)
+        values.append(execution_stamp)
         cur.execute(
             f"INSERT OR IGNORE INTO universe_snapshots ({columns}) VALUES ({placeholders})",
             values,
@@ -145,7 +175,9 @@ def save_universe_snapshots(rows: List[Dict[str, Any]], path: str = "artifacts/u
 
 
 def _parse_snapshot(row: sqlite3.Row) -> Dict[str, Any]:
+    keys = set(row.keys())
     parsed = {column: row[column] for column in SNAPSHOT_COLUMNS}
+    parsed["executed_at"] = row["executed_at"] if "executed_at" in keys else None
     raw_reasons = parsed.get("veto_reasons")
     if not raw_reasons:
         parsed["veto_reasons"] = []
@@ -196,20 +228,65 @@ def load_latest_scan(path: str) -> List[Dict[str, Any]]:
     return [_parse_snapshot(row) for row in rows]
 
 
-def load_symbol_history(path: str, symbol: str, limit: int = 24) -> List[Dict[str, Any]]:
-    """Most recent ``limit`` snapshots for ``symbol``, oldest first."""
+def load_symbol_history(
+    path: str,
+    symbol: str,
+    limit: int = 24,
+    since: Optional[str] = None,
+) -> List[Dict[str, Any]]:
+    """Snapshots for ``symbol``, oldest first.
+
+    ``since`` keeps rows at or after that timestamp and ignores ``limit``.
+    Without ``since``, the most recent ``limit`` rows are returned.
+    """
     if not os.path.exists(path):
         return []
     conn = _connect(path)
+    if since is None:
+        rows = conn.execute(
+            """SELECT * FROM universe_snapshots
+               WHERE symbol = ?
+               ORDER BY scan_timestamp DESC
+               LIMIT ?""",
+            (symbol, int(limit)),
+        ).fetchall()
+        conn.close()
+        history = [_parse_snapshot(row) for row in rows]
+        history.reverse()
+        return history
     rows = conn.execute(
         """SELECT * FROM universe_snapshots
-           WHERE symbol = ?
-           ORDER BY scan_timestamp DESC
-           LIMIT ?""",
-        (symbol, int(limit)),
+           WHERE symbol = ? AND scan_timestamp >= ?
+           ORDER BY scan_timestamp ASC""",
+        (symbol, since),
     ).fetchall()
     conn.close()
-    history = [_parse_snapshot(row) for row in rows]
-    history.reverse()
-    return history
+    return [_parse_snapshot(row) for row in rows]
+
+
+def load_previous_ranks(path: str, before_timestamp: str) -> Dict[str, Optional[int]]:
+    """Latest earlier rank for each symbol.
+
+    The lookup walks back to the most recent snapshot before
+    ``before_timestamp`` that already has a rank. Symbols with no earlier
+    rank are omitted. Callers treat a missing symbol as no previous rank.
+    """
+    if not os.path.exists(path):
+        return {}
+    conn = _connect(path)
+    rows = conn.execute(
+        """SELECT u.symbol AS symbol, u.rank AS rank
+           FROM universe_snapshots u
+           JOIN (
+               SELECT symbol, MAX(scan_timestamp) AS scan_timestamp
+               FROM universe_snapshots
+               WHERE scan_timestamp < ? AND rank IS NOT NULL
+               GROUP BY symbol
+           ) prev
+             ON u.symbol = prev.symbol
+            AND u.scan_timestamp = prev.scan_timestamp""",
+        (before_timestamp,),
+    ).fetchall()
+    conn.close()
+    return {row["symbol"]: int(row["rank"]) for row in rows}
 

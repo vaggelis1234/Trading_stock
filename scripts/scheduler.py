@@ -13,10 +13,9 @@ if str(ROOT) not in sys.path:
 
 from apscheduler.schedulers.blocking import BlockingScheduler
 
-from src.data.scan import build_universe_top_sp500
+from src.data.scan import build_sp500_universe
 from src.universe.pipeline import run_universe
 
-UNIVERSE_SIZE = int(os.getenv("UNIVERSE_SIZE", "100"))
 ARTIFACT_DIR = os.getenv("ARTIFACT_DIR", "artifacts")
 DB_PATH = os.getenv("UNIVERSE_DB", os.path.join(ARTIFACT_DIR, "universe.db"))
 
@@ -25,7 +24,9 @@ def resolve_symbols():
     raw = os.getenv("UNIVERSE_SYMBOLS", "").strip()
     if raw:
         return [part.strip().upper() for part in raw.split(",") if part.strip()]
-    return build_universe_top_sp500(n=UNIVERSE_SIZE)
+    raw_size = os.getenv("UNIVERSE_SIZE", "").strip()
+    limit = int(raw_size) if raw_size else None
+    return build_sp500_universe(limit=limit)
 
 
 def job():
