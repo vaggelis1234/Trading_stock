@@ -1,0 +1,4 @@
+# Hourly Universe run. This file does not change score weights or veto rules.
+# 1-minute SIP enrichment runs only after 1h ranking, and only for this many
+# PASS candidates. Fewer eligible rows use whatever exists. Zero skips 1m.
+max_candidates_for_1m: 10

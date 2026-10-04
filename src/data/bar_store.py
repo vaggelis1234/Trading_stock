@@ -15,10 +15,23 @@ from typing import Optional
 import pandas as pd
 
 from src.data.provider import prepare_ohlcv
+from src.data.session_bars import HourlySession, classify_hourly_session
 
 logger = logging.getLogger(__name__)
 
 OHLCV_COLUMNS = ["open", "high", "low", "close", "volume"]
+SESSION_COLUMNS = (
+    "session_type",
+    "observed_minutes",
+    "expected_minutes",
+    "coverage_ratio",
+)
+_SESSION_COLUMN_SQL = {
+    "session_type": "TEXT",
+    "observed_minutes": "INTEGER",
+    "expected_minutes": "INTEGER",
+    "coverage_ratio": "REAL",
+}
 TAIL_CALENDAR_DAYS = 7
 HOURLY_OVERLAP = pd.Timedelta(hours=2)
 SESSION_CLOSE_HOUR = 16
@@ -44,6 +57,19 @@ ON CONFLICT(symbol, interval) DO UPDATE SET
     checked_through = excluded.checked_through,
     latest_bar = excluded.latest_bar
 """
+
+
+def _ensure_hourly_session_columns(conn: sqlite3.Connection) -> None:
+    """Add hourly session facts to a market_bars table created without them.
+
+    ``market_coverage`` is the fetch window (what was checked). These columns
+    are per-bar minute presence. They stay on ``market_bars`` and are not
+    written into ``market_coverage``.
+    """
+    names = {row[1] for row in conn.execute("PRAGMA table_info(market_bars)")}
+    for name, declaration in _SESSION_COLUMN_SQL.items():
+        if names and name not in names:
+            conn.execute(f"ALTER TABLE market_bars ADD COLUMN {name} {declaration}")
 
 
 def bars_db_path(path: Optional[str] = None) -> str:
@@ -142,6 +168,10 @@ class BarStore:
                     low REAL,
                     close REAL,
                     volume REAL,
+                    session_type TEXT,
+                    observed_minutes INTEGER,
+                    expected_minutes INTEGER,
+                    coverage_ratio REAL,
                     PRIMARY KEY (symbol, interval, bar_timestamp)
                 )"""
             )
@@ -155,9 +185,72 @@ class BarStore:
                     PRIMARY KEY (symbol, interval)
                 )"""
             )
+            _ensure_hourly_session_columns(conn)
             conn.commit()
         finally:
             conn.close()
+
+    def update_hourly_session(self, symbol: str, bar_timestamp, minute_bars: Optional[pd.DataFrame] = None) -> bool:
+        """Store session facts on an existing 1h row.
+
+        Does not insert a bar. A weekend, holiday, or other missing hour stays
+        absent rather than becoming a zero row. ``minute_bars=None`` keeps
+        ``observed_minutes`` and ``coverage_ratio`` NULL. An invalid timestamp
+        is not given a session type. OHLCV columns are left unchanged.
+        ``market_coverage`` is not updated.
+        """
+        session = classify_hourly_session(bar_timestamp, minute_bars)
+        if not session.valid:
+            return False
+        conn = self._connect()
+        try:
+            cursor = conn.execute(
+                """UPDATE market_bars
+                   SET session_type = ?,
+                       observed_minutes = ?,
+                       expected_minutes = ?,
+                       coverage_ratio = ?
+                   WHERE symbol = ? AND interval = '1h' AND bar_timestamp = ?""",
+                (
+                    session.session_type,
+                    session.observed_minutes,
+                    session.expected_minutes,
+                    session.coverage_ratio,
+                    symbol,
+                    _utc_iso(bar_timestamp),
+                ),
+            )
+            conn.commit()
+            return cursor.rowcount == 1
+        finally:
+            conn.close()
+
+    def hourly_session(self, symbol: str, bar_timestamp) -> Optional[HourlySession]:
+        """Session facts stored for one 1h bar, or ``None`` when the row is absent."""
+        conn = self._connect()
+        try:
+            row = conn.execute(
+                """SELECT session_type, observed_minutes, expected_minutes, coverage_ratio
+                   FROM market_bars
+                   WHERE symbol = ? AND interval = '1h' AND bar_timestamp = ?""",
+                (symbol, _utc_iso(bar_timestamp)),
+            ).fetchone()
+        finally:
+            conn.close()
+        if row is None:
+            return None
+        session_type = row["session_type"]
+        observed = row["observed_minutes"]
+        expected = row["expected_minutes"]
+        ratio = row["coverage_ratio"]
+        valid = session_type is not None and expected is not None
+        return HourlySession(
+            valid=valid,
+            session_type=session_type,
+            expected_minutes=None if expected is None else int(expected),
+            observed_minutes=None if observed is None else int(observed),
+            coverage_ratio=None if ratio is None else float(ratio),
+        )
 
     def coverage(self, symbol: str, interval: str):
         conn = self._connect()
@@ -302,13 +395,34 @@ class BarStore:
         conn = self._connect()
         try:
             conn.execute("BEGIN")
+            saved_session = {}
             if replace_all:
+                saved_session = {
+                    row["bar_timestamp"]: tuple(row[column] for column in SESSION_COLUMNS)
+                    for row in conn.execute(
+                        f"""SELECT bar_timestamp, {", ".join(SESSION_COLUMNS)}
+                            FROM market_bars
+                            WHERE symbol = ? AND interval = ?""",
+                        (symbol, interval),
+                    )
+                    if any(row[column] is not None for column in SESSION_COLUMNS)
+                }
                 conn.execute(
                     "DELETE FROM market_bars WHERE symbol = ? AND interval = ?",
                     (symbol, interval),
                 )
             if rows:
                 conn.executemany(_BAR_UPSERT, rows)
+            for iso, values in saved_session.items():
+                conn.execute(
+                    """UPDATE market_bars
+                       SET session_type = ?,
+                           observed_minutes = ?,
+                           expected_minutes = ?,
+                           coverage_ratio = ?
+                       WHERE symbol = ? AND interval = ? AND bar_timestamp = ?""",
+                    (*values, symbol, interval, iso),
+                )
             existing = conn.execute(
                 """SELECT window_start, latest_bar FROM market_coverage
                    WHERE symbol = ? AND interval = ?""",

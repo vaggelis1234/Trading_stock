@@ -497,3 +497,105 @@ def test_universe_snapshots_match_direct_evaluation(tmp_path):
                 assert json.loads(got[column]) == list(want[column])
             else:
                 assert got[column] == want[column], (column, got[column], want[column])
+
+
+def _hour_frame(stamp, close=10.0):
+    index = pd.DatetimeIndex([pd.Timestamp(stamp)])
+    return _ohlcv(index, [close], volume=100.0)
+
+
+def test_old_market_bars_gains_session_columns_without_new_rows(tmp_path):
+    path = tmp_path / "market_bars.db"
+    conn = sqlite3.connect(path)
+    conn.execute(
+        """CREATE TABLE market_bars (
+            symbol TEXT NOT NULL,
+            interval TEXT NOT NULL,
+            bar_timestamp TEXT NOT NULL,
+            open REAL, high REAL, low REAL, close REAL, volume REAL,
+            PRIMARY KEY (symbol, interval, bar_timestamp)
+        )"""
+    )
+    conn.execute(
+        """INSERT INTO market_bars
+           (symbol, interval, bar_timestamp, open, high, low, close, volume)
+           VALUES ('AAPL', '1h', '2026-03-06T09:00:00+00:00', 1, 1, 1, 1, 1)"""
+    )
+    conn.commit()
+    conn.close()
+
+    store = BarStore(str(path))
+    conn = sqlite3.connect(store.path)
+    columns = [row[1] for row in conn.execute("PRAGMA table_info(market_bars)")]
+    coverage_columns = [row[1] for row in conn.execute("PRAGMA table_info(market_coverage)")]
+    count = conn.execute("SELECT COUNT(*) FROM market_bars").fetchone()[0]
+    stored = conn.execute(
+        """SELECT session_type, observed_minutes, expected_minutes, coverage_ratio
+           FROM market_bars"""
+    ).fetchone()
+    conn.close()
+    assert columns[-4:] == ["session_type", "observed_minutes", "expected_minutes", "coverage_ratio"]
+    assert "coverage_ratio" not in coverage_columns
+    assert count == 1
+    assert stored == (None, None, None, None)
+
+
+def test_session_metadata_updates_an_existing_hour_only(tmp_path):
+    stamp = pd.Timestamp("2026-03-09 10:00", tz="America/New_York")
+    weekend = pd.Timestamp("2026-03-07 10:00", tz="America/New_York")
+    store = BarStore(str(tmp_path / "market_bars.db"))
+    clock = pd.Timestamp("2026-03-09 20:00", tz="UTC")
+    provider = RecordingProvider({"1h": _hour_frame(stamp, close=12.0)})
+    store.sync(provider, "AAPL", "1h", "2026-03-01", "2026-03-10", clock)
+    before = store.coverage("AAPL", "1h")
+
+    assert store.update_hourly_session("AAPL", weekend, pd.DataFrame()) is False
+    assert store.hourly_session("AAPL", weekend) is None
+    conn = sqlite3.connect(store.path)
+    assert conn.execute("SELECT COUNT(*) FROM market_bars").fetchone()[0] == 1
+    conn.close()
+
+    pending = store.update_hourly_session("AAPL", stamp)
+    assert pending is True
+    stored = store.hourly_session("AAPL", stamp)
+    assert stored.session_type == "REGULAR"
+    assert stored.expected_minutes == 60
+    assert stored.observed_minutes is None
+    assert stored.coverage_ratio is None
+
+    minutes = pd.DataFrame(
+        {"close": [1.0, 1.0]},
+        index=pd.DatetimeIndex([stamp, stamp + pd.Timedelta(minutes=15)]),
+    )
+    assert store.update_hourly_session("AAPL", stamp, minutes) is True
+    counted = store.hourly_session("AAPL", stamp)
+    assert counted.observed_minutes == 2
+    assert counted.coverage_ratio == 2 / 60
+    assert store.coverage("AAPL", "1h")["checked_through"] == before["checked_through"]
+    assert store.coverage("AAPL", "1h")["window_start"] == before["window_start"]
+
+    off_grid = pd.Timestamp("2026-03-09 09:30", tz="America/New_York")
+    assert store.update_hourly_session("AAPL", off_grid) is False
+    loaded = store.load_window("AAPL", "1h", "2026-03-01", "2026-03-10")
+    assert list(loaded.columns) == ["open", "high", "low", "close", "volume"]
+    assert loaded["close"].iloc[0] == 12.0
+
+
+def test_ohlcv_refresh_keeps_session_metadata(tmp_path):
+    stamp = pd.Timestamp("2026-03-06 04:00", tz="America/New_York")
+    later = stamp + pd.Timedelta(hours=4)
+    store = BarStore(str(tmp_path / "market_bars.db"))
+    clock = pd.Timestamp("2026-03-06 21:00", tz="UTC")
+    provider = RecordingProvider({"1h": _ohlcv(pd.DatetimeIndex([stamp, later]), [10.0, 11.0])})
+    store.sync(provider, "AAPL", "1h", "2026-03-01", "2026-03-10", clock)
+    minutes = pd.DataFrame({"close": [1.0]}, index=pd.DatetimeIndex([stamp]))
+    assert store.update_hourly_session("AAPL", stamp, minutes) is True
+
+    provider.frames["1h"] = _ohlcv(pd.DatetimeIndex([stamp, later]), [10.5, 11.0])
+    store.sync(provider, "AAPL", "1h", "2026-03-01", "2026-03-10", clock + pd.Timedelta(hours=3))
+    kept = store.hourly_session("AAPL", stamp)
+    assert kept.session_type == "PRE_MARKET"
+    assert kept.observed_minutes == 1
+    assert kept.coverage_ratio == 1 / 60
+    reloaded = store.load_window("AAPL", "1h", "2026-03-01", "2026-03-10")
+    assert reloaded.loc[stamp.tz_convert("UTC"), "close"] == 10.5

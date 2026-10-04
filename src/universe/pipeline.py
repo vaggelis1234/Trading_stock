@@ -13,10 +13,12 @@ from typing import Optional
 import pandas as pd
 
 from src.data.bar_store import BarStore, bars_db_path
+from src.data.minute_enrichment import enrich_candidates, save_minute_enrichment
 from src.data.provider import YFinanceMarketDataProvider, prepare_ohlcv
 from src.persistence.store import save_universe_snapshots
 from src.universe.earnings import UnavailableEarningsProvider, earnings_within_48h
 from src.universe.metrics import compute_symbol_metrics, metrics_as_of, precompute_symbol_metrics, to_utc_iso
+from src.universe.minute_candidates import max_candidates_for_1m, select_minute_candidates
 from src.universe.ranking import rank_snapshots
 from src.universe.scoring import apply_score, load_universe_weights
 from src.universe.veto import apply_hard_vetoes
@@ -162,6 +164,7 @@ def run_universe(
     provider = provider or YFinanceMarketDataProvider()
     earnings = earnings if earnings is not None else UnavailableEarningsProvider()
     weights = load_universe_weights(weights_path)
+    minute_limit = max_candidates_for_1m()
 
     clock = pd.Timestamp.now(tz="UTC") if now is None else pd.Timestamp(now)
     if clock.tzinfo is None:
@@ -216,21 +219,28 @@ def run_universe(
             grouped[as_of].append(_scored_row(symbol, as_of, metrics_as_of(prepared, as_of), flag, weights))
 
     latest: list[dict] = []
+    latest_candidates: list[dict] = []
     for as_of in timestamps:
         ranked = rank_snapshots(grouped.get(as_of, []))
         if not ranked:
             continue
+        candidates = select_minute_candidates(ranked, limit=minute_limit)
         save_universe_snapshots(ranked, db_path)
         latest = ranked
+        latest_candidates = candidates
         passed = sum(1 for row in ranked if row["veto_status"] == "PASS")
         scored = sum(1 for row in ranked if row.get("final_score") is not None)
         logger.info(
-            "universe snapshot %s pass=%s blocked=%s scored=%s",
+            "universe snapshot %s pass=%s blocked=%s scored=%s minute_candidates=%s",
             ranked[0]["scan_timestamp"],
             passed,
             len(ranked) - passed,
             scored,
+            [row["symbol"] for row in candidates],
         )
 
     _export_latest(latest, artifact_dir)
+    if latest_candidates:
+        enrichment = enrich_candidates(provider, latest_candidates, hourly_map, bars)
+        save_minute_enrichment(db_path, enrichment)
     return latest
