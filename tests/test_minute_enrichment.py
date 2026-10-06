@@ -151,6 +151,73 @@ class _Provider:
         return self.frames[symbol]
 
 
+def test_partial_current_hour_keeps_only_minutes_before_the_scan():
+    hour = pd.Timestamp("2026-03-09T17:00:00Z")
+    scan = pd.Timestamp("2026-03-09T17:02:00Z")
+    minutes = _minutes(hour, 5)
+    record = enrich_hourly_bar("AAPL", scan, hour, 100.0, 101.0, minutes, scan)
+    assert record["scan_timestamp"] == "2026-03-09T17:02:00+00:00"
+    assert record["hour_timestamp"] == "2026-03-09T17:00:00+00:00"
+    assert record["observed_minutes"] == 2
+    assert record["expected_minutes"] == 60
+    assert record["last_price"] == 101.5
+    assert record["minute_volume"] == 2.0
+
+
+def test_previous_hour_stops_at_the_hour_boundary():
+    hour = pd.Timestamp("2026-03-09T16:00:00Z")
+    scan = pd.Timestamp("2026-03-09T17:02:00Z")
+    minutes = _minutes(hour, 70)
+    record = enrich_hourly_bar("AAPL", scan, hour, 100.0, 110.0, minutes, scan)
+    assert record["hour_timestamp"] == "2026-03-09T16:00:00+00:00"
+    assert record["scan_timestamp"] == "2026-03-09T17:02:00+00:00"
+    assert record["observed_minutes"] == 60
+    assert record["expected_minutes"] == 60
+    assert record["coverage_ratio"] == 1.0
+    assert record["last_price"] == 159.5
+    assert record["minute_volume"] == 60.0
+
+
+def test_minute_at_or_after_the_scan_is_excluded():
+    hour = pd.Timestamp("2026-03-09T17:00:00Z")
+    scan = pd.Timestamp("2026-03-09T17:02:00Z")
+    frame = pd.DataFrame(
+        {
+            "open": [1.0, 2.0, 9.0],
+            "high": [1.0, 2.0, 9.0],
+            "low": [1.0, 2.0, 9.0],
+            "close": [1.0, 2.0, 9.0],
+            "volume": [1.0, 1.0, 100.0],
+        },
+        index=pd.to_datetime(
+            ["2026-03-09T17:00:00Z", "2026-03-09T17:02:00Z", "2026-03-09T17:03:00Z"],
+            utc=True,
+        ),
+    )
+    record = enrich_hourly_bar("AAPL", scan, hour, 1.0, 2.0, frame, scan)
+    assert record["observed_minutes"] == 1
+    assert record["last_price"] == 1.0
+    assert record["minute_volume"] == 1.0
+
+
+def test_stale_hourly_bar_is_not_used():
+    hour = pd.Timestamp("2026-03-09T16:00:00Z")
+    scan = hour + pd.Timedelta(hours=2, minutes=1)
+    hourly = pd.DataFrame(
+        {"open": [100.0], "high": [101.0], "low": [99.0], "close": [100.0], "volume": [1.0]},
+        index=pd.DatetimeIndex([hour]),
+    )
+    provider = _Provider({"AAPL": _minutes(hour, 60)})
+    records = enrich_candidates(
+        provider,
+        [{"symbol": "AAPL", "scan_timestamp": scan.isoformat(), "veto_status": "PASS", "rank": 1}],
+        {"AAPL": hourly},
+    )
+    assert provider.calls == []
+    assert records[0]["hour_timestamp"] is None
+    assert records[0]["observed_minutes"] is None
+
+
 def test_only_selected_candidates_request_one_minute_bars():
     hour = pd.Timestamp("2026-10-02 18:00", tz="UTC")
     scan = hour + pd.Timedelta(hours=1)

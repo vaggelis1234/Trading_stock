@@ -238,6 +238,21 @@ def test_one_minute_requests_use_the_sip_minute_timeframe(monkeypatch):
     assert list(frame["volume"]) == [5, 6]
 
 
+def test_sip_request_end_stops_fifteen_minutes_before_now(monkeypatch):
+    fixed_now = pd.Timestamp("2026-10-06T17:02:00Z")
+    monkeypatch.setattr(pd.Timestamp, "now", staticmethod(lambda tz=None: fixed_now))
+    pages = {None: {"bars": {"AAPL": [_bar("2026-10-06T16:00:00Z", 10)]}, "next_page_token": None}}
+    provider, session = _provider(monkeypatch, pages)
+    provider.get_bars("AAPL", "2026-10-01", "2026-10-07", "1d")
+    assert session.calls[0]["params"]["end"] == "2026-10-06T16:47:00Z"
+    assert session.calls[0]["params"]["feed"] == "sip"
+
+    session.calls.clear()
+    empty = provider.get_bars("AAPL", "2026-10-06T17:00:00Z", "2026-10-06T17:02:00Z", "1m")
+    assert session.calls == []
+    assert empty.empty
+
+
 def test_daily_weekday_is_in_session_and_weekend_is_not():
     module = _alignment_module()
     weekday = pd.Timestamp("2024-01-02T05:00:00Z")

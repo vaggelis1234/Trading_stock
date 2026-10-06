@@ -1,8 +1,8 @@
 """Universe v1 scan: data, metrics, hard veto, score, rank, persist.
 
-The scan does not submit orders. Each hourly bar in the lookback window
-becomes its own snapshot. A later scan inserts new timestamps and leaves
-existing rows in place.
+The scan does not submit orders. Each earlier hourly bar in the lookback
+window stays its own snapshot. The latest snapshot is the scan clock. A
+later scan inserts new timestamps and leaves existing rows in place.
 """
 
 from collections import defaultdict
@@ -14,10 +14,10 @@ import pandas as pd
 
 from src.data.bar_store import BarStore, bars_db_path
 from src.data.minute_enrichment import enrich_candidates, save_minute_enrichment
-from src.data.provider import YFinanceMarketDataProvider, prepare_ohlcv
+from src.data.provider import AlpacaMarketDataProvider, MarketDataUnavailable, prepare_ohlcv
 from src.persistence.store import save_universe_snapshots
 from src.universe.earnings import UnavailableEarningsProvider, earnings_within_48h
-from src.universe.metrics import compute_symbol_metrics, metrics_as_of, precompute_symbol_metrics, to_utc_iso
+from src.universe.metrics import as_utc, compute_symbol_metrics, metrics_as_of, precompute_symbol_metrics, to_utc_iso
 from src.universe.minute_candidates import max_candidates_for_1m, select_minute_candidates
 from src.universe.ranking import rank_snapshots
 from src.universe.scoring import apply_score, load_universe_weights
@@ -57,6 +57,17 @@ def common_timestamps(hourly_by_symbol: dict, lookback: int) -> list[pd.Timestam
     if lookback > 0:
         clock = clock[-lookback:]
     return list(clock)
+
+
+def _snapshot_timestamps(hourly_stamps, clock) -> list[pd.Timestamp]:
+    """Hourly lookback rows, then the scan clock as the current decision.
+
+    Earlier rows keep the hourly bar timestamps. The latest row is ``clock``
+    floored to the minute. A scan that lands on an hourly bar is stored once.
+    """
+    decision = as_utc(clock).floor("min")
+    historical = [as_utc(stamp).floor("min") for stamp in hourly_stamps if as_utc(stamp).floor("min") < decision]
+    return historical + [decision]
 
 
 def _scored_row(symbol: str, as_of, metrics: dict, earnings_flag: Optional[bool], weights: dict) -> dict:
@@ -146,6 +157,22 @@ def _export_latest(rows: list[dict], artifact_dir: str) -> None:
     scores.to_csv(os.path.join(artifact_dir, f"scores_{stamp}.csv"), index=False)
 
 
+def _raise_if_market_data_source_failed(actions: dict, symbols: list[str]) -> None:
+    """Stop before a snapshot when every series failed.
+
+    ``actions["failed"]`` is the existing per-series counter. One symbol can
+    fail while another succeeds. When every sync failed, the source produced
+    no universe and a snapshot would be entirely ``BLOCKED_INSUFFICIENT_DATA``.
+    """
+    if len(symbols) < 2:
+        return
+    total = sum(actions.values())
+    if total and actions["failed"] == total:
+        raise MarketDataUnavailable(
+            "market data provider failed for every symbol; no snapshot was written"
+        )
+
+
 def run_universe(
     symbols: list[str],
     *,
@@ -161,7 +188,7 @@ def run_universe(
     now: Optional[pd.Timestamp] = None,
 ) -> list[dict]:
     """Evaluate ``symbols`` and append snapshots. Returns the latest ranked scan."""
-    provider = provider or YFinanceMarketDataProvider()
+    provider = provider or AlpacaMarketDataProvider()
     earnings = earnings if earnings is not None else UnavailableEarningsProvider()
     weights = load_universe_weights(weights_path)
     minute_limit = max_candidates_for_1m()
@@ -181,10 +208,13 @@ def run_universe(
         try:
             daily_map[symbol] = bars.sync_and_load(provider, symbol, "1d", daily_start, end_text, clock)
             hourly_map[symbol] = bars.sync_and_load(provider, symbol, "1h", hourly_start, end_text, clock)
+        except MarketDataUnavailable:
+            raise
         except Exception:
             logger.exception("market data sync failed for %s", symbol)
             daily_map[symbol] = prepare_ohlcv(None)
             hourly_map[symbol] = prepare_ohlcv(None)
+    _raise_if_market_data_source_failed(bars.actions, symbols)
     logger.info(
         "bar sync initialized=%s backfilled=%s refreshed=%s skipped=%s failed=%s rebuilt=%s",
         bars.actions["initialized"],
@@ -195,9 +225,7 @@ def run_universe(
         bars.actions["rebuilt"],
     )
 
-    timestamps = common_timestamps(hourly_map, lookback_bars)
-    if not timestamps:
-        timestamps = [clock.floor("min")]
+    timestamps = _snapshot_timestamps(common_timestamps(hourly_map, lookback_bars), clock)
 
     grouped: dict = defaultdict(list)
     for symbol in symbols:

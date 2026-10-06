@@ -50,11 +50,13 @@ Two timeframes feed the score. Both are OHLCV (`timestamp`, `open`, `high`, `low
 
 `src/data/provider.py` defines `MarketDataProvider.get_bars(symbol, start, end, interval)`. `prepare_ohlcv` is the only frame the metric, veto, scoring, and ranking code sees: lowercase columns, UTC index, floored to the minute, de-duplicated, rows with a missing close dropped. Naive timestamps are interpreted as UTC.
 
-`YFinanceMarketDataProvider` is the default. `run_universe` and the scheduler construct it when no provider is passed. It delegates to `fetch_historical_yfinance`.
+`AlpacaMarketDataProvider` is the production default. `run_universe` constructs it when no provider is passed, and the scheduler uses that same path. It requests `https://data.alpaca.markets/v2/stocks/bars` with `feed=sip` and `adjustment=all`. A requested end inside the last 15 minutes is pulled back to that delay, because this SIP subscription rejects the whole query when the end reaches recent data. Intervals are `1d` → `1Day`, `1h` → `1Hour`, and `1m` → `1Min`. `BRK-B` and `BF-B` are sent as `BRK.B` and `BF.B`. The end bound is exclusive. Credentials are `ALPACA_API_KEY` and `ALPACA_API_SECRET`. `AlpacaIngest` remains the older broker wrapper and is not the universe default.
 
-`AlpacaMarketDataProvider` is implemented and is not the default. It requests `https://data.alpaca.markets/v2/stocks/bars` with `feed=sip` and `adjustment=all`. Intervals are `1d` → `1Day`, `1h` → `1Hour`, and `1m` → `1Min`. `BRK-B` and `BF-B` are sent as `BRK.B` and `BF.B`. The end bound is exclusive. Credentials are `ALPACA_API_KEY` and `ALPACA_API_SECRET`. `AlpacaIngest` remains the older broker wrapper and is not the universe default.
+`YFinanceMarketDataProvider` is no longer used by the production Universe path. It still delegates to `fetch_historical_yfinance` for tests and for `scripts/ab_alpaca_yahoo.py`.
 
 `scripts/ab_alpaca_yahoo.py` is an offline comparison of Yahoo and Alpaca SIP for AAPL, MSFT, BRK-B, NVDA, and POOL. It does not select the production provider and does not open `market_bars.db`.
+
+A missing `ALPACA_API_KEY` or `ALPACA_API_SECRET`, or an Alpaca `401`/`403`, raises `MarketDataUnavailable` on the first request. `BarStore` does not count that as a per-symbol `failed` sync, and `run_universe` writes no snapshot. One symbol whose fetch raises for another reason stays in the scan as insufficient data when another symbol still has bars. When every sync is `failed` across two or more symbols, the same exception stops the scan before `save_universe_snapshots`. The `failed` total is the existing `BarStore.actions` counter.
 
 Daily trend rule: a daily bar counts only when its America/New_York timestamp is strictly before the scan's New York session midnight. The in-progress session cannot enter `EMA200`. Hourly indicators use the last bar at or before the scan time, and only when that bar is at most two hours old (`HOURLY_STALE_AFTER`). Older hourly data is left blank. These are alignment rules so a scan does not read the future. They are not trading rules.
 
@@ -193,9 +195,13 @@ The pipeline does not select a position and does not call the broker.
 
 ## 1-minute enrichment
 
-`src/data/minute_enrichment.py` runs after the latest ranking, and only for the candidates just selected. It does not run for the rest of the universe and it does not run before ranking. It uses the same provider object the scan used. With the default provider that call is a yfinance `1m` request. An Alpaca SIP `1Min` request happens when the scan was given `AlpacaMarketDataProvider`.
+`src/data/minute_enrichment.py` runs after the latest ranking, and only for the candidates just selected. It does not run for the rest of the universe and it does not run before ranking. It uses the same provider object the scan used. A non-empty minute window is an Alpaca SIP `1Min` request.
 
-For each candidate the subject is the last hourly bar at or before the scan. Minute bars count only when their timestamp is inside `[hour, hour + 1h)` and strictly before the scan. Minutes from the previous hour, the next hour, or at/after the scan are ignored. A 5-minute or 10-minute return requires the exact minute that many minutes earlier. A missing minute is not filled.
+`scan_timestamp` and `hour_timestamp` are different facts. The latest snapshot's `scan_timestamp` is the scan clock in UTC, floored to the minute. Earlier lookback snapshots stay on the hourly bar timestamps. `executed_at` stays the time the row was written. `hour_timestamp` is the last hourly bar at or before that scan, and only when it is within `HOURLY_STALE_AFTER` (2 hours). A staler bar is not used. With no valid hourly bar the symbol keeps the existing insufficient-data result.
+
+The causal minute window is `[hour_timestamp, min(hour_timestamp + 1h, scan_timestamp))`. A minute at or after the scan is out. A minute of the next clock hour is out, even when the scan is already inside that next hour. A scan at 17:02 that still uses the 17:00 bar keeps 17:00 and 17:01. A scan at 17:02 that still uses the 16:00 bar keeps 16:00 through 16:59. `observed_minutes`, `coverage_ratio`, and `expected_minutes` stay on that hourly label. `expected_minutes` remains 60. The 16:00 bar does not gain minutes from 17:00 onward.
+
+The latest score uses the same scan clock and the same freshness rule. Score formulas are unchanged. A 5-minute or 10-minute return requires the exact minute that many minutes earlier. A missing minute is not filled.
 
 The result is raw data. It is stored in `minute_enrichment` inside the universe database, keyed by `(scan_timestamp, symbol)`. It is not written into `universe_snapshots` and it does not change a score, a rank, a veto, or an order. When the hour is a valid session label, the same lookup also updates `observed_minutes` and `coverage_ratio` on the existing `market_bars` row.
 
@@ -218,11 +224,11 @@ The result is raw data. It is stored in `minute_enrichment` inside the universe 
 
 ## Snapshot schema
 
-SQLite database, default `artifacts/universe.db` (`UNIVERSE_DB` overrides it), table `universe_snapshots`. Each scan inserts rows. `UNIQUE(scan_timestamp, symbol)` plus `INSERT OR IGNORE` leaves an existing snapshot unchanged. History is the point of the table: a later hour is a new row. `scan_timestamp` is the market-data time. `executed_at` is the wall clock of the write and is never copied from `scan_timestamp`. An older database gains `executed_at` on open.
+SQLite database, default `artifacts/universe.db` (`UNIVERSE_DB` overrides it), table `universe_snapshots`. Each scan inserts rows. `UNIQUE(scan_timestamp, symbol)` plus `INSERT OR IGNORE` leaves an existing snapshot unchanged. History is the point of the table: a later decision is a new row. The latest `scan_timestamp` is the scan clock, UTC, floored to the minute. Earlier rows from the same run keep their hourly bar timestamps. `executed_at` is the wall clock of the write and is never copied from `scan_timestamp`. An older database gains `executed_at` on open.
 
 | Column | Meaning |
 | --- | --- |
-| `scan_timestamp` | Evaluation time, UTC ISO-8601 |
+| `scan_timestamp` | Decision time, UTC ISO-8601. The latest row is the scan clock. Earlier lookback rows are hourly bar timestamps |
 | `symbol` | Ticker |
 | `hourly_close` | Hourly close used as price |
 | `daily_close` | Last completed daily close |
@@ -261,7 +267,7 @@ The page reads the snapshot database. The main table is the latest scan's top 10
 
 Movement compares the current rank with the symbol's previous stored rank (`previous_rank - current_rank`). An improvement is `🟢 ↑N`, a drop is `🔴 ↓N`, an unchanged rank is `—`, and no earlier rank is `NEW`.
 
-A symbol selector under the table loads history for that symbol only. The range is `24H` (default), `3D`, or `5D`, measured back from the latest snapshot. The history table shows time, `PASS` or `BLOCKED`, and a readable reason (`—` for PASS; veto codes joined with `; ` for BLOCKED). Charts for RSI, Score, ATR%, and Volume Ratio use those stored rows. When the latest scan's earnings checks are all `unavailable`, the page says the earnings veto is pending.
+A symbol selector under the table loads history for that symbol only. The range is `24H` (default), `3D`, or `5D`, measured back from the clock hour that contains the latest snapshot. The history table shows time, `PASS` or `BLOCKED`, and a readable reason (`—` for PASS; veto codes joined with `; ` for BLOCKED). Charts for RSI, Score, ATR%, and Volume Ratio use those stored rows. Coverage compares stored rows with that hourly grid. A latest snapshot at `17:02` fills the `17:00` hour, so it is not reported as a missing `:00` row, and the earlier hourly snapshots stay on their own timestamps. When the latest scan's earnings checks are all `unavailable`, the page says the earnings veto is pending.
 
 The FastAPI app in `src/ui/app.py` remains a JSON view of the scores CSV.
 
@@ -284,8 +290,8 @@ With no `--symbols`, the scan evaluates the full S&P 500 constituent list. `--si
 - ATR uses Wilder's recursive average seeded on the first true range, not an SMA-seeded ATR.
 - ADV20 is daily dollar volume. VolumeRatio is hourly.
 - Score caps (10% above EMA200, ±2% MACD, VolumeRatio 2.0, 20× ADV) only keep the weighted score on a common 0–10 scale. They are not optimized entry rules.
-- yfinance `history()` adjusted prices are whatever that library returns. The universe does not add a second adjustment. Alpaca SIP prices use `adjustment=all` when that provider is selected.
-- The default scan provider is still yfinance. `AlpacaMarketDataProvider` is available and is not wired in by `run_universe` or the scheduler.
+- Production bars come from Alpaca SIP with `adjustment=all`. `YFinanceMarketDataProvider` remains for tests and the offline Yahoo comparison. The universe does not add a second adjustment on top of the provider response.
+- An existing `artifacts/market_bars.db` filled by an earlier Yahoo scan is not deleted by the provider switch. BarStore still skips a window it already considers fresh, and a material price change rebuilds only through the existing revision path.
 - `observed_minutes` cannot be recovered from an hourly bar. Early pre-market and late after-hours hours often contain fewer than 60 trade minutes. That is recorded as coverage, not treated as a data failure.
 - `REGULAR` hourly bars do not contain the 09:30 open or the 16:00 closing print. Those prints sit in the two `MIXED` hours.
 - One pipeline run backfills the last 24 hourly bars already on disk. After that, new hours append when the scan runs again. The UI ranges `24H`, `3D`, and `5D` read those stored snapshots. A cash session is shorter than a calendar day, and a weekend has no new bars, so a range can contain fewer points than its label suggests.
@@ -309,7 +315,6 @@ These files are still in the repo. Universe v1 does not call them to trade.
 ## Not implemented
 
 - Using `coverage_ratio` or any enrichment field as a veto, a score weight, or a trade filter
-- Selecting `AlpacaMarketDataProvider` as the default hourly scan provider
 - A reliable earnings calendar, news sentiment, and short interest
 - Cross-sectional z-score scoring
 - Order execution guard, position guardian, dynamic take-profit and stop-loss

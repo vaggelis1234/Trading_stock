@@ -14,7 +14,7 @@ from typing import Optional
 
 import pandas as pd
 
-from src.data.provider import prepare_ohlcv
+from src.data.provider import MarketDataUnavailable, prepare_ohlcv
 from src.data.session_bars import HourlySession, classify_hourly_session
 
 logger = logging.getLogger(__name__)
@@ -273,9 +273,15 @@ class BarStore:
         required_end: str,
         clock,
     ) -> str:
-        """Bring one series up to ``clock``. Provider failures leave the store unchanged."""
+        """Bring one series up to ``clock``. Provider failures leave the store unchanged.
+
+        ``MarketDataUnavailable`` is the source itself rejecting the scan.
+        It is not counted as a per-symbol failure.
+        """
         try:
             action = self._sync(provider, symbol, interval, required_start, required_end, clock)
+        except MarketDataUnavailable:
+            raise
         except Exception:
             logger.exception("bar sync failed %s %s", symbol, interval)
             action = "failed"
@@ -330,6 +336,8 @@ class BarStore:
     def _fetch(self, provider, symbol: str, interval: str, start: str, end: str):
         try:
             raw = provider.get_bars(symbol, start, end, interval)
+        except MarketDataUnavailable:
+            raise
         except Exception:
             logger.exception("bar sync provider failed %s %s", symbol, interval)
             return None

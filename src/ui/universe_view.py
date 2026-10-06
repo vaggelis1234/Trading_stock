@@ -147,10 +147,15 @@ def symbol_detail_lines(row: Mapping, previous_rank) -> list[str]:
     return lines
 
 
+def _hour_floor(value) -> pd.Timestamp:
+    """Clock hour that contains a snapshot. ``17:02`` belongs to ``17:00``."""
+    return pd.Timestamp(to_utc_iso(value)).floor("h")
+
+
 def history_start(anchor, range_key: str = DEFAULT_HISTORY_RANGE) -> str:
     if range_key not in HISTORY_RANGES:
         raise ValueError(f"unknown history range: {range_key}")
-    return to_utc_iso(pd.Timestamp(anchor) - HISTORY_RANGES[range_key])
+    return to_utc_iso(_hour_floor(anchor) - HISTORY_RANGES[range_key])
 
 
 def as_display_timestamp(value) -> pd.Timestamp:
@@ -314,13 +319,13 @@ def metric_snapshot_options(rows: Sequence[Mapping], metric: str) -> list[str]:
 
 
 def expected_snapshot_timestamps(anchor, range_key: str = DEFAULT_HISTORY_RANGE) -> list[str]:
-    """Hourly UTC timestamps from the range start through ``anchor``, inclusive.
+    """Hourly UTC timestamps from the range start through the anchor hour.
 
-    The scan clock is hourly. This does not invent rows for hours that were
-    never stored.
+    The current scan may sit at ``17:02``. That row covers the ``17:00`` hour.
+    It does not move the historical grid onto the ``:02`` minute.
     """
     start = pd.Timestamp(history_start(anchor, range_key))
-    end = pd.Timestamp(to_utc_iso(anchor))
+    end = _hour_floor(anchor)
     stamps = []
     cursor = start
     while cursor <= end:
@@ -342,8 +347,8 @@ def metric_coverage(rows: Sequence[Mapping], metric: str, anchor, range_key: str
     """
     expected = expected_snapshot_timestamps(anchor, range_key)
     actual = [_stored_stamp(row["scan_timestamp"]) for row in rows]
-    present = set(actual)
-    missing = [stamp for stamp in expected if stamp not in present]
+    present_hours = {_hour_floor(stamp) for stamp in actual}
+    missing = [stamp for stamp in expected if _hour_floor(stamp) not in present_hours]
     null_metric = [
         _stored_stamp(row["scan_timestamp"])
         for row in rows

@@ -15,6 +15,7 @@ import pandas as pd
 
 from src.data.provider import prepare_ohlcv
 from src.data.session_bars import classify_hourly_session
+from src.universe.metrics import HOURLY_STALE_AFTER
 
 logger = logging.getLogger(__name__)
 
@@ -62,7 +63,7 @@ def enrich_hourly_bar(
     """
     hour_start = _as_utc(hour_timestamp)
     scan = _as_utc(as_of).floor("min")
-    window_end = min(hour_start + pd.Timedelta(hours=1), scan)
+    window_end = _minute_window_end(hour_start, scan)
     session = classify_hourly_session(hour_start, _empty_minutes(hour_start) if minute_bars is not None else None)
     record = _blank(symbol, scan, hour_start, session)
     if minute_bars is None or window_end <= hour_start:
@@ -147,7 +148,7 @@ def enrich_candidates(
             continue
         hour_ts = _as_utc(bar.name)
         scan_ts = _as_utc(scan).floor("min")
-        window_end = min(hour_ts + pd.Timedelta(hours=1), scan_ts)
+        window_end = _minute_window_end(hour_ts, scan_ts)
         minutes = None
         if window_end > hour_ts:
             try:
@@ -214,6 +215,15 @@ def _empty_minutes(hour_start) -> pd.DataFrame:
     return pd.DataFrame(columns=["open", "high", "low", "close", "volume"], index=pd.DatetimeIndex([], tz="UTC"))
 
 
+def _minute_window_end(hour_start, scan):
+    """Exclusive end of the causal minute window for one hourly bar.
+
+    Minutes belong to ``[hour_start, hour_start + 1h)`` and must also be
+    strictly before the scan. A minute of the next hour stays out.
+    """
+    return min(_as_utc(hour_start) + pd.Timedelta(hours=1), _as_utc(scan).floor("min"))
+
+
 def _causal_minutes(minute_bars: pd.DataFrame, hour_start, window_end):
     if len(minute_bars) == 0:
         return minute_bars
@@ -240,6 +250,8 @@ def _last_bar(hourly, as_of):
         index = index.tz_convert("UTC")
     position = int(index.searchsorted(stamp, side="right")) - 1
     if position < 0:
+        return None
+    if stamp - index[position] > HOURLY_STALE_AFTER:
         return None
     row = hourly.iloc[position]
     row = row.copy()

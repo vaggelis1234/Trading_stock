@@ -240,6 +240,24 @@ def test_metric_dropdown_uses_athens_time_and_leaves_nulls_empty():
     assert "03/06 21:30" not in " ".join(metric_snapshot_options(rows, "Score"))
 
 
+def test_off_hour_scan_covers_its_clock_hour_without_hiding_history():
+    anchor = "2024-06-03T17:02:00+00:00"
+    rows = [
+        _row(scan_timestamp="2024-06-03T15:00:00+00:00", rsi14=40.0),
+        _row(scan_timestamp="2024-06-03T16:00:00+00:00", rsi14=50.0),
+        _row(scan_timestamp=anchor, rsi14=60.0),
+    ]
+    coverage = metric_coverage(rows, "RSI", anchor, "24H")
+    assert coverage["expected"][-1] == "2024-06-03T17:00:00+00:00"
+    assert coverage["actual"][-1] == anchor
+    assert anchor not in coverage["missing"]
+    assert "2024-06-03T17:00:00+00:00" not in coverage["missing"]
+    assert "2024-06-03T16:00:00+00:00" not in coverage["missing"]
+    assert "2024-06-03T15:00:00+00:00" not in coverage["missing"]
+    assert "2024-06-03T14:00:00+00:00" in coverage["missing"]
+    assert history_start(anchor, "24H") == "2024-06-02T17:00:00+00:00"
+
+
 def test_metric_coverage_separates_missing_snapshots_from_null_values():
     anchor = "2024-06-03T18:00:00+00:00"
     rows = [

@@ -1,10 +1,9 @@
 """Market-data seam for Universe v1.
 
 Metric, veto, scoring, and ranking code depend only on OHLCV frames.
-``YFinanceMarketDataProvider`` is the historical default and delegates to the
-existing ``fetch_historical_yfinance`` helper. A later Alpaca-backed provider
-can implement ``get_bars`` with the same columns and replace this class at the
-pipeline boundary.
+``AlpacaMarketDataProvider`` is the production provider. Universe scans
+construct it when no provider is passed. ``YFinanceMarketDataProvider``
+remains for tests and the Yahoo comparison script.
 """
 
 import os
@@ -16,6 +15,15 @@ import requests
 from src.data.ingest import fetch_historical_yfinance
 
 OHLCV_COLUMNS = ["open", "high", "low", "close", "volume"]
+_ALPACA_AUTH_STATUSES = frozenset({401, 403})
+
+
+class MarketDataUnavailable(RuntimeError):
+    """The production market-data source cannot serve this scan.
+
+    Raised for missing Alpaca credentials and for an auth rejection from the
+    SIP endpoint. A later per-symbol fetch error is not this failure.
+    """
 
 
 class MarketDataProvider(Protocol):
@@ -64,6 +72,7 @@ _ALPACA_SYMBOLS = {"BRK-B": "BRK.B", "BF-B": "BF.B"}
 _ALPACA_TIMEFRAMES = {"1d": "1Day", "1h": "1Hour", "1m": "1Min"}
 _ALPACA_PAGE_LIMIT = 10000
 _ALPACA_MAX_PAGES = 500
+_SIP_RECENT_DELAY = pd.Timedelta(minutes=15)
 
 
 def _bound(value: str) -> pd.Timestamp:
@@ -77,12 +86,23 @@ def _rfc3339(stamp: pd.Timestamp) -> str:
     return stamp.isoformat().replace("+00:00", "Z")
 
 
-class AlpacaMarketDataProvider:
-    """Historical SIP bars for the Universe A/B experiment.
+def _sip_request_end(requested: pd.Timestamp) -> pd.Timestamp:
+    """Keep a SIP query out of the trailing 15 minutes.
 
-    Requests ``feed=sip`` only. Prices use ``adjustment=all`` because the
-    installed Yahoo ``history()`` path adjusts for splits and dividends.
-    This class is not the production default.
+    This subscription rejects the whole request when ``end`` reaches recent
+    SIP data. Older bars in the same window stay available.
+    """
+    latest = pd.Timestamp.now(tz="UTC") - _SIP_RECENT_DELAY
+    if requested > latest:
+        return latest
+    return requested
+
+
+class AlpacaMarketDataProvider:
+    """Production historical SIP bars for Universe scans.
+
+    Requests ``feed=sip`` only. Prices use ``adjustment=all``. Credentials
+    are read from ``ALPACA_API_KEY`` and ``ALPACA_API_SECRET``.
     """
 
     def __init__(self, session: Optional[requests.Session] = None):
@@ -97,8 +117,11 @@ class AlpacaMarketDataProvider:
             raise ValueError(f"unsupported interval {interval!r}")
         start_ts = _bound(start)
         end_ts = _bound(end)
+        request_end = _sip_request_end(end_ts)
+        if start_ts >= request_end:
+            return prepare_ohlcv(None)
         alpaca_symbol = _ALPACA_SYMBOLS.get(str(symbol).strip().upper(), str(symbol).strip().upper())
-        raw = self._pages(alpaca_symbol, timeframe, start_ts, end_ts)
+        raw = self._pages(alpaca_symbol, timeframe, start_ts, request_end)
         frame = prepare_ohlcv(raw)
         if frame.empty:
             return frame
@@ -109,7 +132,9 @@ class AlpacaMarketDataProvider:
 
     def _require_credentials(self) -> None:
         if not self._api_key or not self._api_secret:
-            raise RuntimeError("ALPACA_API_KEY and ALPACA_API_SECRET are required for historical SIP bars")
+            raise MarketDataUnavailable(
+                "ALPACA_API_KEY and ALPACA_API_SECRET are required for historical SIP bars"
+            )
 
     def _pages(self, symbol: str, timeframe: str, start: pd.Timestamp, end: pd.Timestamp) -> pd.DataFrame:
         params = {
@@ -148,6 +173,9 @@ class AlpacaMarketDataProvider:
             },
             timeout=60,
         )
+        status = getattr(response, "status_code", None)
+        if status in _ALPACA_AUTH_STATUSES:
+            raise MarketDataUnavailable(f"Alpaca market data rejected the request ({status})")
         response.raise_for_status()
         return response.json()
 

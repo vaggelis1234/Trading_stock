@@ -7,7 +7,7 @@ from src.data.bar_store import HOURLY_OVERLAP, BarStore, completed_session_close
 from src.data.provider import prepare_ohlcv
 from src.persistence.store import SNAPSHOT_COLUMNS
 from src.universe.metrics import compute_symbol_metrics
-from src.universe.pipeline import common_timestamps, evaluate_symbol, run_universe
+from src.universe.pipeline import _snapshot_timestamps, common_timestamps, evaluate_symbol, run_universe
 from src.universe.ranking import rank_snapshots
 from src.universe.scoring import load_universe_weights
 
@@ -440,6 +440,8 @@ def test_universe_snapshots_match_direct_evaluation(tmp_path):
 
         def get_bars(self, symbol, start, end, interval):
             self.calls.append((symbol, start, end, interval))
+            if interval == "1m":
+                return pd.DataFrame(columns=["open", "high", "low", "close", "volume"])
             return frames[(symbol, interval)]
 
     provider = MapProvider()
@@ -469,7 +471,10 @@ def test_universe_snapshots_match_direct_evaluation(tmp_path):
             (prepared[(symbol, "1h")].index >= pd.Timestamp(hourly_start, tz="UTC"))
             & (prepared[(symbol, "1h")].index < pd.Timestamp(end, tz="UTC"))
         ]
-    timestamps = common_timestamps({symbol: prepared[(symbol, "1h")] for symbol in ("UP", "DOWN")}, 4)
+    timestamps = _snapshot_timestamps(
+        common_timestamps({symbol: prepared[(symbol, "1h")] for symbol in ("UP", "DOWN")}, 4),
+        clock,
+    )
     weights = load_universe_weights()
     expected = []
     for as_of in timestamps:
