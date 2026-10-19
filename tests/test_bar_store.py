@@ -1,3 +1,4 @@
+import logging
 import sqlite3
 
 import pandas as pd
@@ -308,6 +309,71 @@ def test_newest_hourly_bars_update_without_a_rebuild_and_older_changes_rebuild(t
     action = store.sync(provider, "AAPL", "1h", hourly_start, _window(much_later)[2], much_later)
     assert action == "rebuilt"
     assert provider.calls[-1]["start"] == hourly_start
+
+
+def test_revision_log_records_only_the_first_material_difference(tmp_path, caplog):
+    clock = pd.Timestamp("2026-09-16 18:00", tz="UTC")
+    later = clock + pd.Timedelta(hours=6)
+    _, hourly_start, end = _window(clock)
+    index = pd.date_range(clock - pd.Timedelta(hours=8), periods=9, freq="h", tz="UTC")
+    original = _ohlcv(index, [30.0 + i for i in range(9)])
+    changed = original.copy()
+    changed.iloc[0, changed.columns.get_loc("close")] = 1.0
+    changed.iloc[1, changed.columns.get_loc("close")] = 2.0
+    provider = RecordingProvider({"1h": original})
+    store = BarStore(str(tmp_path / "market_bars.db"))
+    store.sync(provider, "AAPL", "1h", hourly_start, end, clock)
+    provider.frames["1h"] = changed
+
+    with caplog.at_level(logging.INFO, logger="src.data.bar_store"):
+        action = store.sync(provider, "AAPL", "1h", hourly_start, _window(later)[2], later)
+
+    assert action == "rebuilt"
+    revisions = [record.getMessage() for record in caplog.records if record.getMessage().startswith("bar revision ")]
+    assert revisions == [
+        "bar revision AAPL 1h bar_utc=2026-09-16T10:00:00+00:00 "
+        "scan_utc=2026-09-17T00:00:00+00:00 age_hours=14",
+        "bar revision column=close stored=30 fetched=1 absolute=29 relative=0.966666666667",
+    ]
+    assert "2026-09-16T11:00:00+00:00" not in " ".join(revisions)
+
+
+def test_revision_log_lists_every_differing_column_without_changing_detection(tmp_path, caplog):
+    clock = pd.Timestamp("2026-09-16 18:00", tz="UTC")
+    later = clock + pd.Timedelta(hours=6)
+    _, hourly_start, end = _window(clock)
+    index = pd.date_range(clock - pd.Timedelta(hours=8), periods=9, freq="h", tz="UTC")
+    original = prepare_ohlcv(_ohlcv(index, [30.0 + i for i in range(9)]))
+    provider = RecordingProvider({"1h": original})
+    store = BarStore(str(tmp_path / "market_bars.db"))
+    store.sync(provider, "AAPL", "1h", hourly_start, end, clock)
+
+    with caplog.at_level(logging.INFO, logger="src.data.bar_store"):
+        assert store._revision_detected("AAPL", "1h", original, later) is False
+    assert [record.getMessage() for record in caplog.records if "bar revision " in record.getMessage()] == []
+
+    changed = original.copy()
+    changed.iloc[0, changed.columns.get_loc("open")] = 40.0
+    changed.iloc[0, changed.columns.get_loc("high")] = 50.0
+    changed.iloc[0, changed.columns.get_loc("low")] = 20.0
+    changed.iloc[0, changed.columns.get_loc("close")] = 1.0
+    changed.iloc[0, changed.columns.get_loc("volume")] = 1_500_000.0
+    changed.iloc[1, changed.columns.get_loc("close")] = 2.0
+    caplog.clear()
+    with caplog.at_level(logging.INFO, logger="src.data.bar_store"):
+        assert store._revision_detected("AAPL", "1h", changed, later) is True
+
+    revisions = [record.getMessage() for record in caplog.records if record.getMessage().startswith("bar revision ")]
+    assert revisions == [
+        "bar revision AAPL 1h bar_utc=2026-09-16T10:00:00+00:00 "
+        "scan_utc=2026-09-17T00:00:00+00:00 age_hours=14",
+        "bar revision column=open stored=30 fetched=40 absolute=10 relative=0.333333333333",
+        "bar revision column=high stored=30.2 fetched=50 absolute=19.8 relative=0.655629139073",
+        "bar revision column=low stored=29.8 fetched=20 absolute=9.8 relative=0.328859060403",
+        "bar revision column=close stored=30 fetched=1 absolute=29 relative=0.966666666667",
+        "bar revision column=volume stored=1000000 fetched=1500000 absolute=500000 relative=0.5 percent=50",
+    ]
+    assert "2026-09-16T11:00:00+00:00" not in " ".join(revisions)
 
 
 def test_load_clips_bars_outside_the_required_window(tmp_path):

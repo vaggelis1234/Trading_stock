@@ -14,12 +14,16 @@ from typing import Optional
 
 import pandas as pd
 
-from src.data.provider import MarketDataUnavailable, prepare_ohlcv
+from src.data.provider import MarketDataUnavailable, batch_size_for_window, prepare_ohlcv
 from src.data.session_bars import HourlySession, classify_hourly_session
 
 logger = logging.getLogger(__name__)
 
 OHLCV_COLUMNS = ["open", "high", "low", "close", "volume"]
+BAR_SYNC_ACTIONS = ("initialized", "backfilled", "refreshed", "skipped", "failed", "rebuilt")
+RUN_SUCCESS = "SUCCESS"
+RUN_PARTIAL = "PARTIAL"
+RUN_FAILED = "FAILED"
 SESSION_COLUMNS = (
     "session_type",
     "observed_minutes",
@@ -109,6 +113,76 @@ def _materially_different(stored: sqlite3.Row, row: pd.Series) -> bool:
     return False
 
 
+def _column_revision_fields(stored: sqlite3.Row, row: pd.Series, column: str):
+    """Difference for one column, using the same tolerance as ``_materially_different``.
+
+    ``None`` means this column is inside that tolerance. The return value is
+    only a description. ``_materially_different`` still decides the rebuild.
+    """
+    left = stored[column]
+    right = _number(row[column])
+    if left is None or right is None:
+        if left != right:
+            return left, right, None, None
+        return None
+    if pd.isna(left):
+        return left, right, None, None
+    left_value = float(left)
+    absolute = abs(left_value - right)
+    if absolute <= max(1e-4, abs(right) * 1e-8):
+        return None
+    relative = absolute / abs(left_value) if left_value != 0 else None
+    return left_value, right, absolute, relative
+
+
+def _revision_log_fields(stored: sqlite3.Row, row: pd.Series) -> list:
+    """Every materially different column on the bar that already triggered rebuild."""
+    fields = []
+    for column in OHLCV_COLUMNS:
+        described = _column_revision_fields(stored, row, column)
+        if described is not None:
+            fields.append((column, *described))
+    return fields
+
+
+def _volume_percent(stored_value, fetched_value):
+    """Signed percent change from the stored volume. ``None`` when it cannot be computed."""
+    if stored_value is None or fetched_value is None:
+        return None
+    if pd.isna(stored_value) or pd.isna(fetched_value) or float(stored_value) == 0:
+        return None
+    return (float(fetched_value) - float(stored_value)) / float(stored_value) * 100.0
+
+
+def _metric_text(value) -> str:
+    if value is None or (isinstance(value, float) and pd.isna(value)):
+        return "none"
+    return format(float(value), ".12g")
+
+
+def _utc_text(value) -> str:
+    return _as_utc(value).isoformat()
+
+
+def describe_bar_sync(actions: dict, *, valid_bars: bool) -> str:
+    """Classify one scan's existing per-series counters.
+
+    ``failed == 0`` is ``SUCCESS``. Failures alongside bars the scan can use
+    are ``PARTIAL``. Every recorded series failing is ``FAILED`` even when
+    older cached bars are still on disk. Failures with no usable bars are
+    ``FAILED`` as well.
+    """
+    failed = int(actions.get("failed", 0))
+    total = sum(int(actions.get(name, 0)) for name in BAR_SYNC_ACTIONS)
+    if total and failed == total:
+        return RUN_FAILED
+    if failed == 0:
+        return RUN_SUCCESS
+    if valid_bars:
+        return RUN_PARTIAL
+    return RUN_FAILED
+
+
 def completed_session_close(clock) -> pd.Timestamp:
     """UTC timestamp when the latest finished New York session closed.
 
@@ -137,14 +211,7 @@ def _completed_overlap_bar(interval: str, bar_ts: pd.Timestamp, clock, newest: p
 class BarStore:
     def __init__(self, path: Optional[str] = None):
         self.path = bars_db_path(path)
-        self.actions = {
-            "initialized": 0,
-            "backfilled": 0,
-            "refreshed": 0,
-            "skipped": 0,
-            "failed": 0,
-            "rebuilt": 0,
-        }
+        self.actions = {name: 0 for name in BAR_SYNC_ACTIONS}
         self._init_db()
 
     def _connect(self) -> sqlite3.Connection:
@@ -285,11 +352,118 @@ class BarStore:
         except Exception:
             logger.exception("bar sync failed %s %s", symbol, interval)
             action = "failed"
+        return self._note(action, symbol, interval)
+
+    def _note(self, action: str, symbol: str, interval: str) -> str:
         self.actions[action] = self.actions.get(action, 0) + 1
         if action == "skipped":
             logger.debug("bar sync skipped %s %s", symbol, interval)
         else:
             logger.info("bar sync %s %s %s", action, symbol, interval)
+        return action
+
+    def sync_many(self, provider, symbols: list[str], interval: str, required_start: str, required_end: str, clock) -> None:
+        """Sync one timeframe for many symbols, batching identical windows.
+
+        Providers without ``get_bars_many`` keep the per-symbol ``sync`` path.
+        A failed batch does not advance coverage and does not delete bars.
+        """
+        if not hasattr(provider, "get_bars_many"):
+            for symbol in symbols:
+                self.sync(provider, symbol, interval, required_start, required_end, clock)
+            return
+        groups: dict[tuple[str, str], list[tuple[str, str]]] = {}
+        for symbol in symbols:
+            plan = self._plan_fetch(symbol, interval, required_start, required_end, clock)
+            if plan is None:
+                self._note("skipped", symbol, interval)
+                continue
+            groups.setdefault((plan[0], plan[1]), []).append((symbol, plan[2]))
+        for (start, end), planned in groups.items():
+            size = batch_size_for_window(interval, start, end)
+            for offset in range(0, len(planned), size):
+                chunk = planned[offset:offset + size]
+                self._sync_chunk(provider, chunk, interval, start, end, required_start, required_end, clock)
+
+    def _plan_fetch(self, symbol: str, interval: str, required_start: str, required_end: str, clock):
+        """Return ``(request_start, request_end, kind)`` or ``None`` when the series is fresh."""
+        state = self.coverage(symbol, interval)
+        if state is None:
+            return (required_start, required_end, "initialized")
+        if state["window_start"] > required_start:
+            return (required_start, required_end, "backfilled")
+        if interval == "1d" and _as_utc(state["checked_through"]) >= completed_session_close(clock):
+            return None
+        if interval == "1h" and _as_utc(state["checked_through"]) >= _as_utc(clock).floor("min"):
+            return None
+        return (self._tail_start(interval, required_start, state), required_end, "refreshed")
+
+    def _sync_chunk(self, provider, planned, interval, start, end, required_start, required_end, clock) -> None:
+        symbols = [symbol for symbol, _kind in planned]
+        try:
+            result = provider.get_bars_many(symbols, start, end, interval)
+        except MarketDataUnavailable:
+            raise
+        except Exception:
+            logger.exception("bar sync batch failed %s", interval)
+            for symbol in symbols:
+                self._note("failed", symbol, interval)
+            return
+        frames = getattr(result, "frames", None)
+        failed = set(getattr(result, "failed", ()) or ())
+        if frames is None:
+            for symbol in symbols:
+                self._note("failed", symbol, interval)
+            return
+        kinds = {symbol: kind for symbol, kind in planned}
+        for symbol in symbols:
+            if symbol in failed or symbol not in frames:
+                self._note("failed", symbol, interval)
+                continue
+            try:
+                action = self._apply_fetched(
+                    provider, symbol, interval, frames[symbol], required_start, required_end, clock, kinds[symbol]
+                )
+            except MarketDataUnavailable:
+                raise
+            except Exception:
+                logger.exception("bar sync failed %s %s", symbol, interval)
+                action = "failed"
+            self._note(action, symbol, interval)
+
+    def _apply_fetched(self, provider, symbol, interval, frame, required_start, required_end, clock, kind: str) -> str:
+        prepared = prepare_ohlcv(frame)
+        if kind == "initialized":
+            self._persist(symbol, interval, prepared, required_start, clock, replace_all=False)
+            return "initialized"
+        return self._store_fetched_guarded(
+            provider,
+            symbol,
+            interval,
+            prepared,
+            required_start,
+            required_end,
+            clock,
+            full_window=kind == "backfilled",
+            action=kind,
+        )
+
+    def _store_fetched_guarded(
+        self, provider, symbol, interval, frame, required_start, required_end, clock, full_window: bool, action: str
+    ) -> str:
+        """Same as ``_store_fetched``, but a confirmed empty refetch cannot delete bars."""
+        if frame is None or frame.empty:
+            self._persist(symbol, interval, frame, required_start, clock, replace_all=False)
+            return action
+        if self._revision_detected(symbol, interval, frame, clock):
+            if not full_window:
+                refetch = self._fetch(provider, symbol, interval, required_start, required_end)
+                if refetch is None or refetch.empty:
+                    return "failed"
+                frame = refetch
+            self._persist(symbol, interval, frame, required_start, clock, replace_all=True)
+            return "rebuilt"
+        self._persist(symbol, interval, frame, required_start, clock, replace_all=False)
         return action
 
     def _sync(self, provider, symbol, interval, required_start, required_end, clock) -> str:
@@ -381,6 +555,31 @@ class BarStore:
             if not _completed_overlap_bar(interval, ts, clock, newest):
                 continue
             if _materially_different(previous, row):
+                bar_utc = _as_utc(iso)
+                scan_utc = _as_utc(clock)
+                age_hours = (scan_utc - bar_utc).total_seconds() / 3600.0
+                logger.info(
+                    "bar revision %s %s bar_utc=%s scan_utc=%s age_hours=%s",
+                    symbol,
+                    interval,
+                    _utc_text(bar_utc),
+                    _utc_text(scan_utc),
+                    _metric_text(age_hours),
+                )
+                for column, stored_value, fetched_value, absolute, relative in _revision_log_fields(previous, row):
+                    message = (
+                        "bar revision column=%s stored=%s fetched=%s absolute=%s relative=%s"
+                        % (
+                            column,
+                            _metric_text(stored_value),
+                            _metric_text(fetched_value),
+                            _metric_text(absolute),
+                            _metric_text(relative),
+                        )
+                    )
+                    if column == "volume":
+                        message += " percent=%s" % _metric_text(_volume_percent(stored_value, fetched_value))
+                    logger.info(message)
                 return True
         return False
 
