@@ -4,7 +4,10 @@ import os
 import glob
 import pandas as pd
 
+from src.ui.api.routes import router
+
 app = FastAPI()
+app.include_router(router)
 ARTIFACT_DIR = os.getenv("ARTIFACT_DIR", "artifacts")
 
 
