@@ -46,6 +46,10 @@ def save_trades(trades: List[Dict[str, Any]], path: str = "trades.db"):
     conn.close()
 
 
+SNAPSHOT_CURRENT = "CURRENT"
+SNAPSHOT_LOOKBACK = "LOOKBACK"
+SNAPSHOT_KINDS = (SNAPSHOT_CURRENT, SNAPSHOT_LOOKBACK)
+
 SNAPSHOT_COLUMNS = [
     "scan_timestamp",
     "symbol",
@@ -109,6 +113,7 @@ def init_universe_db(path: str = "artifacts/universe.db") -> None:
            ON universe_snapshots(symbol, scan_timestamp)"""
     )
     _ensure_executed_at(cur)
+    _ensure_run_identity(cur)
     conn.commit()
     conn.close()
 
@@ -122,6 +127,23 @@ def _ensure_executed_at(cur: sqlite3.Cursor) -> None:
     names = {row[1] for row in cur.execute("PRAGMA table_info(universe_snapshots)")}
     if names and "executed_at" not in names:
         cur.execute("ALTER TABLE universe_snapshots ADD COLUMN executed_at TEXT")
+
+
+def _ensure_run_identity(cur: sqlite3.Cursor) -> None:
+    """Add execution identity columns. Existing rows stay NULL.
+
+    ``run_id`` is one id for a single ``run_universe`` execution.
+    ``snapshot_kind`` is ``CURRENT`` for that run's decision snapshot and
+    ``LOOKBACK`` for the earlier timestamps written by the same execution.
+    Nothing here invents ids for rows that were stored before these columns.
+    """
+    names = {row[1] for row in cur.execute("PRAGMA table_info(universe_snapshots)")}
+    if not names:
+        return
+    if "run_id" not in names:
+        cur.execute("ALTER TABLE universe_snapshots ADD COLUMN run_id TEXT")
+    if "snapshot_kind" not in names:
+        cur.execute("ALTER TABLE universe_snapshots ADD COLUMN snapshot_kind TEXT")
 
 
 def _execution_stamp(executed_at: Optional[str]) -> str:
@@ -140,17 +162,25 @@ def save_universe_snapshots(
     rows: List[Dict[str, Any]],
     path: str = "artifacts/universe.db",
     executed_at: Optional[str] = None,
+    run_id: Optional[str] = None,
+    snapshot_kind: Optional[str] = None,
 ) -> int:
     """Insert snapshots. Existing (scan_timestamp, symbol) rows are left unchanged.
 
     ``executed_at`` is the wall-clock time of this save. It is never copied
     from ``scan_timestamp``. Rows written together share one execution time.
+
+    ``run_id`` and ``snapshot_kind`` are execution identity. Both stay NULL
+    when the caller does not supply them. An existing row keeps the identity
+    it was first stored with.
     """
+    if snapshot_kind is not None and snapshot_kind not in SNAPSHOT_KINDS:
+        raise ValueError(f"unknown snapshot_kind: {snapshot_kind}")
     init_universe_db(path)
     conn = sqlite3.connect(path)
     cur = conn.cursor()
     before = cur.execute("SELECT COUNT(*) FROM universe_snapshots").fetchone()[0]
-    stored_columns = SNAPSHOT_COLUMNS + ["executed_at"]
+    stored_columns = SNAPSHOT_COLUMNS + ["executed_at", "run_id", "snapshot_kind"]
     columns = ", ".join(stored_columns)
     placeholders = ", ".join(["?"] * len(stored_columns))
     execution_stamp = _execution_stamp(executed_at)
@@ -164,6 +194,8 @@ def save_universe_snapshots(
                 value = int(value)
             values.append(value)
         values.append(execution_stamp)
+        values.append(run_id)
+        values.append(snapshot_kind)
         cur.execute(
             f"INSERT OR IGNORE INTO universe_snapshots ({columns}) VALUES ({placeholders})",
             values,
@@ -178,6 +210,8 @@ def _parse_snapshot(row: sqlite3.Row) -> Dict[str, Any]:
     keys = set(row.keys())
     parsed = {column: row[column] for column in SNAPSHOT_COLUMNS}
     parsed["executed_at"] = row["executed_at"] if "executed_at" in keys else None
+    parsed["run_id"] = row["run_id"] if "run_id" in keys else None
+    parsed["snapshot_kind"] = row["snapshot_kind"] if "snapshot_kind" in keys else None
     raw_reasons = parsed.get("veto_reasons")
     if not raw_reasons:
         parsed["veto_reasons"] = []
@@ -264,16 +298,21 @@ def load_symbol_history(
     return [_parse_snapshot(row) for row in rows]
 
 
-def load_previous_ranks(path: str, before_timestamp: str) -> Dict[str, Optional[int]]:
-    """Latest earlier rank for each symbol.
+def _ranks_at(conn: sqlite3.Connection, scan_timestamp: str, run_id: str) -> Dict[str, Optional[int]]:
+    rows = conn.execute(
+        """SELECT symbol, rank
+           FROM universe_snapshots
+           WHERE scan_timestamp = ?
+             AND run_id = ?
+             AND snapshot_kind = ?
+             AND rank IS NOT NULL""",
+        (scan_timestamp, run_id, SNAPSHOT_CURRENT),
+    ).fetchall()
+    return {row["symbol"]: int(row["rank"]) for row in rows}
 
-    The lookup walks back to the most recent snapshot before
-    ``before_timestamp`` that already has a rank. Symbols with no earlier
-    rank are omitted. Callers treat a missing symbol as no previous rank.
-    """
-    if not os.path.exists(path):
-        return {}
-    conn = _connect(path)
+
+def _legacy_previous_ranks(conn: sqlite3.Connection, before_timestamp: str) -> Dict[str, Optional[int]]:
+    """Latest earlier ranked row, for snapshots stored before run identity."""
     rows = conn.execute(
         """SELECT u.symbol AS symbol, u.rank AS rank
            FROM universe_snapshots u
@@ -287,6 +326,64 @@ def load_previous_ranks(path: str, before_timestamp: str) -> Dict[str, Optional[
             AND u.scan_timestamp = prev.scan_timestamp""",
         (before_timestamp,),
     ).fetchall()
-    conn.close()
     return {row["symbol"]: int(row["rank"]) for row in rows}
+
+
+def load_previous_ranks(path: str, before_timestamp: str) -> Dict[str, Optional[int]]:
+    """Ranks from the previous operational scan.
+
+    When ``before_timestamp`` belongs to a run, the previous scan is the
+    prior ``CURRENT`` snapshot. ``LOOKBACK`` rows and rows with no ``run_id``
+    are not that scan. A symbol missing there, or stored without a rank, is
+    omitted. Callers treat a missing symbol as no previous rank.
+
+    A snapshot that itself has no ``run_id`` keeps the older lookup.
+    """
+    if not os.path.exists(path):
+        return {}
+    conn = _connect(path)
+    anchor = conn.execute(
+        """SELECT 1 FROM universe_snapshots
+           WHERE scan_timestamp = ? AND run_id IS NOT NULL
+           LIMIT 1""",
+        (before_timestamp,),
+    ).fetchone()
+    if anchor is None:
+        ranks = _legacy_previous_ranks(conn, before_timestamp)
+        conn.close()
+        return ranks
+    conn.close()
+    previous = load_previous_operational_run(path, before_timestamp)
+    if previous is None:
+        return {}
+    conn = _connect(path)
+    ranks = _ranks_at(conn, previous["scan_timestamp"], previous["run_id"])
+    conn.close()
+    return ranks
+
+
+def load_previous_operational_run(path: str, before_timestamp: str) -> Optional[Dict[str, Any]]:
+    """Latest CURRENT decision strictly before ``before_timestamp``.
+
+    LOOKBACK rows and rows with no ``snapshot_kind`` are not decisions.
+    The previous operational run is that CURRENT row's ``run_id``, not the
+    greatest earlier ``scan_timestamp``.
+    """
+    if not os.path.exists(path):
+        return None
+    conn = _connect(path)
+    row = conn.execute(
+        """SELECT run_id, scan_timestamp
+           FROM universe_snapshots
+           WHERE snapshot_kind = ?
+             AND run_id IS NOT NULL
+             AND scan_timestamp < ?
+           ORDER BY scan_timestamp DESC
+           LIMIT 1""",
+        (SNAPSHOT_CURRENT, before_timestamp),
+    ).fetchone()
+    conn.close()
+    if row is None:
+        return None
+    return {"run_id": row["run_id"], "scan_timestamp": row["scan_timestamp"]}
 

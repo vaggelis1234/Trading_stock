@@ -2,8 +2,11 @@ import sqlite3
 from datetime import datetime, timedelta, timezone
 
 from src.persistence.store import (
+    SNAPSHOT_CURRENT,
+    SNAPSHOT_LOOKBACK,
     count_snapshots,
     load_latest_scan,
+    load_previous_operational_run,
     load_previous_ranks,
     load_symbol_history,
     save_universe_snapshots,
@@ -199,3 +202,160 @@ def test_existing_database_gains_executed_at_without_rewriting_old_rows(tmp_path
     assert history[0]["scan_timestamp"] == "2024-06-03T17:00:00+00:00"
     assert history[1]["executed_at"] == "2026-09-29T21:10:00+00:00"
     assert history[1]["executed_at"] != history[1]["scan_timestamp"]
+
+
+def test_legacy_rows_keep_null_run_identity(tmp_path):
+    db = tmp_path / "legacy.db"
+    conn = sqlite3.connect(db)
+    conn.execute(
+        """CREATE TABLE universe_snapshots (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            scan_timestamp TEXT NOT NULL,
+            symbol TEXT NOT NULL,
+            hourly_close REAL,
+            daily_close REAL,
+            daily_ema200 REAL,
+            rsi14 REAL,
+            macd_hist REAL,
+            atr14 REAL,
+            atr_percent REAL,
+            volume REAL,
+            volume_ratio REAL,
+            adv20 REAL,
+            veto_status TEXT NOT NULL,
+            veto_reasons TEXT NOT NULL,
+            earnings_check TEXT NOT NULL,
+            trend_score REAL,
+            momentum_score REAL,
+            volatility_score REAL,
+            volume_liquidity_score REAL,
+            final_score REAL,
+            rank INTEGER,
+            executed_at TEXT,
+            UNIQUE(scan_timestamp, symbol)
+        )"""
+    )
+    conn.execute(
+        """INSERT INTO universe_snapshots
+           (scan_timestamp, symbol, veto_status, veto_reasons, earnings_check, final_score, rank, executed_at)
+           VALUES ('2026-03-09T16:30:00+00:00', 'AAPL', 'PASS', '[]', 'unavailable', 5.0, 4, '2026-03-09T16:30:08+00:00')"""
+    )
+    conn.commit()
+    conn.close()
+
+    save_universe_snapshots(
+        [_snapshot("AAPL", "2026-03-09T17:02:00+00:00", "PASS", [], score=6.0, rank=1)],
+        str(db),
+        run_id="run-new",
+        snapshot_kind=SNAPSHOT_CURRENT,
+    )
+    history = load_symbol_history(str(db), "AAPL", limit=10)
+    assert history[0]["run_id"] is None
+    assert history[0]["snapshot_kind"] is None
+    assert history[0]["final_score"] == 5.0
+    assert history[1]["run_id"] == "run-new"
+    assert history[1]["snapshot_kind"] == SNAPSHOT_CURRENT
+    assert load_previous_operational_run(str(db), "2026-03-09T17:02:00+00:00") is None
+
+
+def test_previous_operational_run_skips_same_run_lookback(tmp_path):
+    db = tmp_path / "universe.db"
+    earlier = "2026-03-09T16:02:00+00:00"
+    lookback = "2026-03-09T17:00:00+00:00"
+    current = "2026-03-09T17:02:00+00:00"
+    save_universe_snapshots(
+        [_snapshot("AAPL", "2026-03-09T16:00:00+00:00", "PASS", [], score=7.0, rank=2)],
+        str(db),
+        run_id="run-a",
+        snapshot_kind=SNAPSHOT_LOOKBACK,
+    )
+    save_universe_snapshots(
+        [_snapshot("AAPL", earlier, "PASS", [], score=7.2, rank=2)],
+        str(db),
+        run_id="run-a",
+        snapshot_kind=SNAPSHOT_CURRENT,
+    )
+    save_universe_snapshots(
+        [_snapshot("AAPL", lookback, "PASS", [], score=8.0, rank=1)],
+        str(db),
+        run_id="run-b",
+        snapshot_kind=SNAPSHOT_LOOKBACK,
+    )
+    save_universe_snapshots(
+        [_snapshot("AAPL", current, "PASS", [], score=8.4, rank=1)],
+        str(db),
+        run_id="run-b",
+        snapshot_kind=SNAPSHOT_CURRENT,
+    )
+
+    history = load_symbol_history(str(db), "AAPL", limit=10)
+    kinds = {row["scan_timestamp"]: row["snapshot_kind"] for row in history}
+    assert kinds[current] == SNAPSHOT_CURRENT
+    assert kinds[lookback] == SNAPSHOT_LOOKBACK
+    assert {row["run_id"] for row in history if row["scan_timestamp"] in {lookback, current}} == {"run-b"}
+
+    conn = sqlite3.connect(db)
+    naive = conn.execute(
+        "SELECT MAX(scan_timestamp) FROM universe_snapshots WHERE scan_timestamp < ?",
+        (current,),
+    ).fetchone()[0]
+    conn.close()
+    assert naive == lookback
+
+    previous = load_previous_operational_run(str(db), current)
+    assert previous == {"run_id": "run-a", "scan_timestamp": earlier}
+
+
+def test_movement_compares_with_previous_operational_current(tmp_path):
+    db = tmp_path / "universe.db"
+    path = str(db)
+
+    def put(run_id, kind, stamp, ranked):
+        save_universe_snapshots(
+            [_snapshot(symbol, stamp, "PASS", [], score=1.0, rank=rank) for symbol, rank in ranked],
+            path,
+            run_id=run_id,
+            snapshot_kind=kind,
+        )
+
+    put("run-a", SNAPSHOT_LOOKBACK, "2026-03-09T15:00:00+00:00", [("AAPL", 4), ("MSFT", 2)])
+    put("run-a", SNAPSHOT_LOOKBACK, "2026-03-09T16:00:00+00:00", [("AAPL", 4), ("MSFT", 2)])
+    put("run-a", SNAPSHOT_LOOKBACK, "2026-03-09T17:00:00+00:00", [("AAPL", 6), ("MSFT", 3)])
+    put("run-a", SNAPSHOT_CURRENT, "2026-03-09T17:02:00+00:00", [("AAPL", 5), ("MSFT", 1), ("POOL", None)])
+    put("run-b", SNAPSHOT_LOOKBACK, "2026-03-09T16:00:00+00:00", [("AAPL", 1)])
+    put("run-b", SNAPSHOT_LOOKBACK, "2026-03-09T17:00:00+00:00", [("AAPL", 1)])
+    put("run-b", SNAPSHOT_LOOKBACK, "2026-03-09T18:00:00+00:00", [("AAPL", 2), ("MSFT", 9), ("NEW", 4), ("POOL", 7)])
+    put("run-b", SNAPSHOT_CURRENT, "2026-03-09T18:02:00+00:00", [("AAPL", 8), ("MSFT", 1), ("NEW", 4), ("POOL", 6)])
+
+    current = "2026-03-09T18:02:00+00:00"
+    previous = load_previous_ranks(path, current)
+    assert previous == {"AAPL": 5, "MSFT": 1}
+
+    from src.ui.universe_view import latest_table
+
+    table = latest_table(load_latest_scan(path), previous).set_index("Symbol")
+    assert table.loc["AAPL", "Movement"] == "🔴 ↓3"
+    assert table.loc["MSFT", "Movement"] == "—"
+    assert table.loc["NEW", "Movement"] == "NEW"
+    assert table.loc["POOL", "Movement"] == "NEW"
+
+
+def test_identified_run_ignores_legacy_rows_for_movement(tmp_path):
+    db = tmp_path / "universe.db"
+    save_universe_snapshots(
+        [_snapshot("AAPL", "2026-03-09T16:00:00+00:00", "PASS", [], score=8.0, rank=50)],
+        str(db),
+    )
+    save_universe_snapshots(
+        [_snapshot("AAPL", "2026-03-09T17:00:00+00:00", "PASS", [], score=8.0, rank=3)],
+        str(db),
+        run_id="run-b",
+        snapshot_kind=SNAPSHOT_LOOKBACK,
+    )
+    save_universe_snapshots(
+        [_snapshot("AAPL", "2026-03-09T17:02:00+00:00", "PASS", [], score=8.0, rank=1)],
+        str(db),
+        run_id="run-b",
+        snapshot_kind=SNAPSHOT_CURRENT,
+    )
+    assert load_previous_ranks(str(db), "2026-03-09T17:02:00+00:00") == {}
