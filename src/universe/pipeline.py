@@ -8,14 +8,22 @@ later scan inserts new timestamps and leaves existing rows in place.
 from collections import defaultdict
 import logging
 import os
+import uuid
 from typing import Optional
 
 import pandas as pd
 
-from src.data.bar_store import BarStore, bars_db_path
+from src.data.bar_store import (
+    BAR_SYNC_ACTIONS,
+    RUN_FAILED,
+    RUN_PARTIAL,
+    BarStore,
+    bars_db_path,
+    describe_bar_sync,
+)
 from src.data.minute_enrichment import enrich_candidates, save_minute_enrichment
 from src.data.provider import AlpacaMarketDataProvider, MarketDataUnavailable, prepare_ohlcv
-from src.persistence.store import save_universe_snapshots
+from src.persistence.store import SNAPSHOT_CURRENT, SNAPSHOT_LOOKBACK, save_universe_snapshots
 from src.universe.earnings import UnavailableEarningsProvider, earnings_within_48h
 from src.universe.metrics import as_utc, compute_symbol_metrics, metrics_as_of, precompute_symbol_metrics, to_utc_iso
 from src.universe.minute_candidates import max_candidates_for_1m, select_minute_candidates
@@ -157,6 +165,38 @@ def _export_latest(rows: list[dict], artifact_dir: str) -> None:
     scores.to_csv(os.path.join(artifact_dir, f"scores_{stamp}.csv"), index=False)
 
 
+def _has_valid_bars(*frames_by_symbol: dict) -> bool:
+    for frames in frames_by_symbol:
+        for frame in frames.values():
+            if frame is not None and len(frame):
+                return True
+    return False
+
+
+def _log_market_data_run(status: str, actions: dict) -> None:
+    """One line with the six existing series counters and the run status."""
+    counts = tuple(actions[name] for name in BAR_SYNC_ACTIONS)
+    template = (
+        "universe run %s initialized=%s backfilled=%s refreshed=%s "
+        "skipped=%s failed=%s rebuilt=%s"
+    )
+    if status == RUN_PARTIAL:
+        logger.warning(
+            template + "; market data is incomplete because one or more series failed",
+            status,
+            *counts,
+        )
+        return
+    if status == RUN_FAILED:
+        logger.error(
+            template + "; no usable market-data result was produced",
+            status,
+            *counts,
+        )
+        return
+    logger.info(template, status, *counts)
+
+
 def _raise_if_market_data_source_failed(actions: dict, symbols: list[str]) -> None:
     """Stop before a snapshot when every series failed.
 
@@ -173,6 +213,13 @@ def _raise_if_market_data_source_failed(actions: dict, symbols: list[str]) -> No
         )
 
 
+def _frame_has_bar(frame: pd.DataFrame, bar_at: pd.Timestamp) -> bool:
+    """True when ``frame`` already contains the completed bar timestamp."""
+    if frame is None or len(frame) == 0:
+        return False
+    return as_utc(bar_at).floor("min") in frame.index
+
+
 def run_universe(
     symbols: list[str],
     *,
@@ -186,8 +233,19 @@ def run_universe(
     hourly_lookback_days: int = 60,
     weights_path: Optional[str] = None,
     now: Optional[pd.Timestamp] = None,
+    hourly_frames: Optional[dict] = None,
+    daily_frames: Optional[dict] = None,
+    require_bar_at=None,
 ) -> list[dict]:
-    """Evaluate ``symbols`` and append snapshots. Returns the latest ranked scan."""
+    """Evaluate ``symbols`` and append snapshots. Returns the latest ranked scan.
+
+    ``hourly_frames`` and ``daily_frames`` bypass that timeframe's provider
+    sync. The scheduled scan passes session bars reconstructed from completed
+    30-minute SIP bars. ``require_bar_at`` is that scan's window start: a
+    symbol missing it is insufficient data, so an older bar inside the
+    two-hour metric window cannot stand in for the missing print.
+    """
+    run_id = str(uuid.uuid4())
     provider = provider or AlpacaMarketDataProvider()
     earnings = earnings if earnings is not None else UnavailableEarningsProvider()
     weights = load_universe_weights(weights_path)
@@ -202,30 +260,35 @@ def run_universe(
     end_text = end.strftime("%Y-%m-%d")
 
     bars = BarStore(bars_db_path(bars_db))
+    if daily_frames is None:
+        bars.sync_many(provider, symbols, "1d", daily_start, end_text, clock)
+    if hourly_frames is None:
+        bars.sync_many(provider, symbols, "1h", hourly_start, end_text, clock)
     daily_map = {}
     hourly_map = {}
     for symbol in symbols:
         try:
-            daily_map[symbol] = bars.sync_and_load(provider, symbol, "1d", daily_start, end_text, clock)
-            hourly_map[symbol] = bars.sync_and_load(provider, symbol, "1h", hourly_start, end_text, clock)
+            if daily_frames is None:
+                daily_map[symbol] = bars.load_window(symbol, "1d", daily_start, end_text)
+            else:
+                daily_map[symbol] = prepare_ohlcv(daily_frames.get(symbol))
+            if hourly_frames is None:
+                hourly_map[symbol] = bars.load_window(symbol, "1h", hourly_start, end_text)
+            else:
+                hourly_map[symbol] = prepare_ohlcv(hourly_frames.get(symbol))
         except MarketDataUnavailable:
             raise
         except Exception:
             logger.exception("market data sync failed for %s", symbol)
             daily_map[symbol] = prepare_ohlcv(None)
             hourly_map[symbol] = prepare_ohlcv(None)
+    status = describe_bar_sync(bars.actions, valid_bars=_has_valid_bars(daily_map, hourly_map))
+    _log_market_data_run(status, bars.actions)
     _raise_if_market_data_source_failed(bars.actions, symbols)
-    logger.info(
-        "bar sync initialized=%s backfilled=%s refreshed=%s skipped=%s failed=%s rebuilt=%s",
-        bars.actions["initialized"],
-        bars.actions["backfilled"],
-        bars.actions["refreshed"],
-        bars.actions["skipped"],
-        bars.actions["failed"],
-        bars.actions["rebuilt"],
-    )
 
     timestamps = _snapshot_timestamps(common_timestamps(hourly_map, lookback_bars), clock)
+    decision = timestamps[-1]
+    required = None if require_bar_at is None else as_utc(require_bar_at).floor("min")
 
     grouped: dict = defaultdict(list)
     for symbol in symbols:
@@ -241,19 +304,28 @@ def run_universe(
             except Exception:
                 logger.exception("earnings lookup failed for %s", symbol)
                 flag = None
-            if prepared is None:
+            missing_slot = required is not None and as_of == decision and not _frame_has_bar(hourly, required)
+            if missing_slot:
+                logger.warning(
+                    "universe scan missing completed bar %s for %s; no bar was synthesized",
+                    required.isoformat(),
+                    symbol,
+                )
+            if prepared is None or missing_slot:
                 grouped[as_of].append(_insufficient_row(symbol, as_of, flag))
                 continue
             grouped[as_of].append(_scored_row(symbol, as_of, metrics_as_of(prepared, as_of), flag, weights))
 
     latest: list[dict] = []
     latest_candidates: list[dict] = []
-    for as_of in timestamps:
+    last_index = len(timestamps) - 1
+    for index, as_of in enumerate(timestamps):
         ranked = rank_snapshots(grouped.get(as_of, []))
         if not ranked:
             continue
         candidates = select_minute_candidates(ranked, limit=minute_limit)
-        save_universe_snapshots(ranked, db_path)
+        kind = SNAPSHOT_CURRENT if index == last_index else SNAPSHOT_LOOKBACK
+        save_universe_snapshots(ranked, db_path, run_id=run_id, snapshot_kind=kind)
         latest = ranked
         latest_candidates = candidates
         passed = sum(1 for row in ranked if row["veto_status"] == "PASS")

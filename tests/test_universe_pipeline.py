@@ -3,10 +3,17 @@ import logging
 import pandas as pd
 import pytest
 
-from src.data.bar_store import BarStore
+from src.data.bar_store import RUN_FAILED, BarStore, describe_bar_sync
 from src.data.minute_enrichment import enrich_candidates
 from src.data.provider import AlpacaMarketDataProvider, MarketDataUnavailable, YFinanceMarketDataProvider
-from src.persistence.store import count_snapshots, load_latest_scan, load_symbol_history
+from src.persistence.store import (
+    SNAPSHOT_CURRENT,
+    SNAPSHOT_LOOKBACK,
+    count_snapshots,
+    load_latest_scan,
+    load_previous_operational_run,
+    load_symbol_history,
+)
 from src.universe.metrics import to_utc_iso
 from src.universe.pipeline import common_timestamps, run_universe
 
@@ -246,9 +253,9 @@ def test_production_scan_defaults_to_alpaca_sip(monkeypatch, tmp_path, caplog):
         def get(self, url, params=None, headers=None, timeout=None):
             query = dict(params or {})
             calls.append({"url": url, "params": query, "headers": dict(headers or {})})
-            symbol = query.get("symbols")
+            requested = set(str(query.get("symbols", "")).split(","))
             timeframe = query.get("timeframe")
-            if symbol != "BRK.B":
+            if "BRK.B" not in requested:
                 return _Payload({"bars": {}, "next_page_token": None})
             rows = pages[timeframe]
             token = query.get("page_token")
@@ -263,6 +270,7 @@ def test_production_scan_defaults_to_alpaca_sip(monkeypatch, tmp_path, caplog):
 
     monkeypatch.setenv("ALPACA_API_KEY", "key-id")
     monkeypatch.setenv("ALPACA_API_SECRET", "key-secret")
+    monkeypatch.setenv("ALPACA_REQUEST_DELAY", "0")
     monkeypatch.setattr("src.data.provider.requests.Session", Session)
     monkeypatch.setattr("src.data.provider.fetch_historical_yfinance", yahoo_must_not_run)
     monkeypatch.setattr("src.data.ingest.fetch_historical_yfinance", yahoo_must_not_run)
@@ -293,7 +301,7 @@ def test_production_scan_defaults_to_alpaca_sip(monkeypatch, tmp_path, caplog):
     assert {call["params"]["adjustment"] for call in calls} == {"all"}
     assert all(call["params"]["end"].endswith("Z") for call in calls)
     assert all(str(pd.Timestamp(call["params"]["start"]).tz) == "UTC" for call in calls)
-    brk_calls = [call for call in calls if call["params"]["symbols"] == "BRK.B"]
+    brk_calls = [call for call in calls if "BRK.B" in str(call["params"]["symbols"]).split(",")]
     assert {call["params"]["timeframe"] for call in brk_calls} >= {"1Day", "1Hour"}
     daily_calls = [call for call in brk_calls if call["params"]["timeframe"] == "1Day"]
     assert daily_calls[0]["params"].get("page_token") is None
@@ -459,6 +467,129 @@ def test_current_snapshot_uses_the_scan_clock_and_history_stays_hourly(tmp_path)
     stored = load_latest_scan(paths["db_path"])
     assert stored[0]["executed_at"] != stored[0]["scan_timestamp"]
     assert stored[0]["scan_timestamp"] == to_utc_iso(decision)
+
+
+def test_one_run_shares_run_id_across_lookbacks_and_one_current(tmp_path):
+    daily, hourly, as_of = _frames("up")
+    decision = as_of + pd.Timedelta(minutes=2)
+    provider = MapProvider({"AAPL": daily}, {"AAPL": hourly})
+    paths = _scan_paths(tmp_path)
+    paths["lookback_bars"] = 24
+    run_universe(["AAPL"], provider=provider, now=decision, **paths)
+    history = load_symbol_history(paths["db_path"], "AAPL", limit=30)
+    assert len(history) == 25
+    assert len({row["run_id"] for row in history}) == 1
+    assert history[0]["run_id"]
+    currents = [row for row in history if row["snapshot_kind"] == SNAPSHOT_CURRENT]
+    lookbacks = [row for row in history if row["snapshot_kind"] == SNAPSHOT_LOOKBACK]
+    assert len(currents) == 1
+    assert len(lookbacks) == 24
+    assert currents[0]["scan_timestamp"] == to_utc_iso(decision)
+
+
+def test_consecutive_runs_keep_distinct_operational_identity(tmp_path):
+    daily, hourly, as_of = _frames("up")
+    first_clock = as_of - pd.Timedelta(minutes=30)
+    second_clock = as_of + pd.Timedelta(minutes=2)
+    provider = MapProvider({"AAPL": daily}, {"AAPL": hourly})
+    paths = _scan_paths(tmp_path)
+    paths["lookback_bars"] = 4
+    run_universe(["AAPL"], provider=provider, now=first_clock, **paths)
+    first = load_latest_scan(paths["db_path"])
+    run_universe(["AAPL"], provider=provider, now=second_clock, **paths)
+    second = load_latest_scan(paths["db_path"])
+    history = load_symbol_history(paths["db_path"], "AAPL", limit=20)
+
+    assert first[0]["snapshot_kind"] == SNAPSHOT_CURRENT
+    assert second[0]["snapshot_kind"] == SNAPSHOT_CURRENT
+    assert first[0]["run_id"] != second[0]["run_id"]
+    assert second[0]["scan_timestamp"] == to_utc_iso(second_clock)
+
+    between = [
+        row for row in history
+        if first[0]["scan_timestamp"] < row["scan_timestamp"] < second[0]["scan_timestamp"]
+    ]
+    assert between
+    assert all(row["snapshot_kind"] == SNAPSHOT_LOOKBACK for row in between)
+    assert all(row["run_id"] == second[0]["run_id"] for row in between)
+
+    previous = load_previous_operational_run(paths["db_path"], second[0]["scan_timestamp"])
+    assert previous == {"run_id": first[0]["run_id"], "scan_timestamp": first[0]["scan_timestamp"]}
+
+
+def _run_record(caplog, status: str):
+    prefix = f"universe run {status} "
+    matches = [record for record in caplog.records if record.getMessage().startswith(prefix)]
+    assert len(matches) == 1
+    return matches[0]
+
+
+def test_universe_run_is_success_when_no_series_fails(tmp_path, caplog):
+    daily, hourly, as_of = _frames("up")
+    provider = MapProvider({"AAPL": daily, "MSFT": daily}, {"AAPL": hourly, "MSFT": hourly})
+    paths = _scan_paths(tmp_path)
+    with caplog.at_level(logging.INFO, logger="src.universe.pipeline"):
+        rows = run_universe(["AAPL", "MSFT"], provider=provider, now=as_of, **paths)
+    record = _run_record(caplog, "SUCCESS")
+    assert record.levelno == logging.INFO
+    assert record.getMessage() == (
+        "universe run SUCCESS initialized=4 backfilled=0 refreshed=0 skipped=0 failed=0 rebuilt=0"
+    )
+    assert not any(item.getMessage().startswith("universe run PARTIAL") for item in caplog.records)
+    assert {row["symbol"] for row in rows} == {"AAPL", "MSFT"}
+    assert count_snapshots(paths["db_path"]) == 2
+
+
+def test_universe_run_is_partial_when_some_series_fail_and_bars_remain(tmp_path, caplog):
+    daily, hourly, as_of = _frames("up")
+
+    class MixedProvider:
+        def get_bars(self, symbol, start, end, interval):
+            if symbol == "BAD":
+                raise RuntimeError("symbol feed failed")
+            return daily if interval == "1d" else hourly
+
+    paths = _scan_paths(tmp_path)
+    with caplog.at_level(logging.INFO, logger="src.universe.pipeline"):
+        rows = run_universe(["GOOD", "BAD"], provider=MixedProvider(), now=as_of, **paths)
+    record = _run_record(caplog, "PARTIAL")
+    assert record.levelno == logging.WARNING
+    message = record.getMessage()
+    assert message == (
+        "universe run PARTIAL initialized=2 backfilled=0 refreshed=0 skipped=0 failed=2 rebuilt=0"
+        "; market data is incomplete because one or more series failed"
+    )
+    assert "SUCCESS" not in message
+    by_symbol = {row["symbol"]: row for row in rows}
+    assert by_symbol["GOOD"]["final_score"] is not None
+    assert by_symbol["BAD"]["veto_status"] == "BLOCKED_INSUFFICIENT_DATA"
+    assert count_snapshots(paths["db_path"]) == 2
+
+
+def test_universe_run_is_failed_when_no_result_can_be_produced(tmp_path, caplog):
+    assert describe_bar_sync({"initialized": 0, "backfilled": 0, "refreshed": 0, "skipped": 0, "failed": 4, "rebuilt": 0}, valid_bars=True) == RUN_FAILED
+
+    class DownProvider:
+        def get_bars(self, symbol, start, end, interval):
+            raise RuntimeError(f"{symbol} feed failed")
+
+    paths = _scan_paths(tmp_path)
+    with caplog.at_level(logging.INFO, logger="src.universe.pipeline"):
+        with pytest.raises(MarketDataUnavailable, match="every symbol"):
+            run_universe(
+                ["AAPL", "MSFT"],
+                provider=DownProvider(),
+                now=pd.Timestamp("2026-03-09T15:00:00Z"),
+                **paths,
+            )
+    record = _run_record(caplog, "FAILED")
+    assert record.levelno == logging.ERROR
+    assert record.getMessage() == (
+        "universe run FAILED initialized=0 backfilled=0 refreshed=0 skipped=0 failed=4 rebuilt=0"
+        "; no usable market-data result was produced"
+    )
+    assert count_snapshots(paths["db_path"]) == 0
+    assert not (tmp_path / "artifacts").exists()
 
 
 def test_a_single_symbol_failure_still_writes_its_snapshot(tmp_path):
