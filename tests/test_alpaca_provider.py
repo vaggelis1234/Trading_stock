@@ -3,8 +3,16 @@ from pathlib import Path
 
 import pandas as pd
 import pytest
+import requests
 
-from src.data.provider import AlpacaMarketDataProvider
+from src.data.provider import (
+    ALPACA_429_MAX_RETRIES,
+    ALPACA_BACKOFF_BASE_SECONDS,
+    ALPACA_BACKOFF_MAX_SECONDS,
+    ALPACA_REQUEST_DELAY_SECONDS,
+    AlpacaMarketDataProvider,
+    MarketDataUnavailable,
+)
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -36,11 +44,11 @@ def _bar(stamp, close, volume=100):
     return {"t": stamp, "o": close, "h": close + 1, "l": close - 1, "c": close, "v": volume}
 
 
-def _provider(monkeypatch, pages):
+def _provider(monkeypatch, pages, request_delay=0.0):
     monkeypatch.setenv("ALPACA_API_KEY", "key-id")
     monkeypatch.setenv("ALPACA_API_SECRET", "key-secret")
     session = _Session(pages)
-    return AlpacaMarketDataProvider(session=session), session
+    return AlpacaMarketDataProvider(session=session, request_delay=request_delay), session
 
 
 def test_missing_credentials_raise_before_any_request(monkeypatch):
@@ -251,6 +259,119 @@ def test_sip_request_end_stops_fifteen_minutes_before_now(monkeypatch):
     empty = provider.get_bars("AAPL", "2026-10-06T17:00:00Z", "2026-10-06T17:02:00Z", "1m")
     assert session.calls == []
     assert empty.empty
+
+
+class _HttpResponse:
+    def __init__(self, status_code, payload=None, headers=None):
+        self.status_code = status_code
+        self.payload = payload or {}
+        self.headers = headers or {}
+
+    def raise_for_status(self):
+        if self.status_code >= 400:
+            raise requests.HTTPError(f"HTTP {self.status_code}", response=self)
+
+    def json(self):
+        return self.payload
+
+
+class _ScriptedSession:
+    def __init__(self, responses):
+        self.responses = list(responses)
+        self.calls = []
+
+    def get(self, url, params=None, headers=None, timeout=None):
+        self.calls.append({"url": url, "params": dict(params or {}), "headers": dict(headers or {})})
+        return self.responses.pop(0)
+
+
+def _scripted_provider(monkeypatch, responses, request_delay=0.0):
+    monkeypatch.setenv("ALPACA_API_KEY", "key-id")
+    monkeypatch.setenv("ALPACA_API_SECRET", "key-secret")
+    session = _ScriptedSession(responses)
+    slept = []
+    monkeypatch.setattr("src.data.provider._sleep", slept.append)
+    provider = AlpacaMarketDataProvider(session=session, request_delay=request_delay)
+    return provider, session, slept
+
+
+def _ok_bar():
+    return _HttpResponse(200, {"bars": {"AAPL": [_bar("2024-01-02T05:00:00Z", 10, 1000)]}, "next_page_token": None})
+
+
+def test_429_waits_for_retry_after_then_returns_bars(monkeypatch):
+    provider, session, slept = _scripted_provider(
+        monkeypatch,
+        [_HttpResponse(429, headers={"Retry-After": "1.5"}), _ok_bar()],
+    )
+    frame = provider.get_bars("AAPL", "2024-01-01", "2024-01-04", "1d")
+    assert slept == [1.5]
+    assert len(session.calls) == 2
+    assert session.calls[0]["params"]["feed"] == "sip"
+    assert session.calls[1]["params"] == session.calls[0]["params"]
+    assert list(frame["close"]) == [10]
+
+
+def test_429_without_retry_after_uses_capped_exponential_backoff(monkeypatch):
+    monkeypatch.setattr("src.data.provider.ALPACA_BACKOFF_BASE_SECONDS", 5.0)
+    monkeypatch.setattr("src.data.provider.ALPACA_BACKOFF_MAX_SECONDS", 8.0)
+    provider, session, slept = _scripted_provider(
+        monkeypatch,
+        [_HttpResponse(429), _HttpResponse(429), _HttpResponse(429), _ok_bar()],
+    )
+    frame = provider.get_bars("AAPL", "2024-01-01", "2024-01-04", "1d")
+    assert slept == [5.0, 8.0, 8.0]
+    assert len(session.calls) == 4
+    assert list(frame["close"]) == [10]
+    assert ALPACA_BACKOFF_BASE_SECONDS == 0.5
+    assert ALPACA_BACKOFF_MAX_SECONDS == 8.0
+
+
+def test_429_retries_stop_and_raise_a_clean_http_error(monkeypatch):
+    provider, session, slept = _scripted_provider(
+        monkeypatch,
+        [_HttpResponse(429, headers={"Retry-After": "0.25"})] * (ALPACA_429_MAX_RETRIES + 1),
+    )
+    with pytest.raises(requests.HTTPError, match="429"):
+        provider.get_bars("AAPL", "2024-01-01", "2024-01-04", "1d")
+    assert len(session.calls) == ALPACA_429_MAX_RETRIES + 1
+    assert slept == [0.25] * ALPACA_429_MAX_RETRIES
+    assert ALPACA_429_MAX_RETRIES == 4
+
+
+def test_other_http_errors_are_not_retried(monkeypatch):
+    provider, session, slept = _scripted_provider(monkeypatch, [_HttpResponse(500, {"message": "down"})])
+    with pytest.raises(requests.HTTPError, match="500"):
+        provider.get_bars("AAPL", "2024-01-01", "2024-01-04", "1d")
+    assert len(session.calls) == 1
+    assert slept == []
+
+    provider, session, slept = _scripted_provider(monkeypatch, [_HttpResponse(401)])
+    with pytest.raises(MarketDataUnavailable, match=r"rejected the request \(401\)"):
+        provider.get_bars("AAPL", "2024-01-01", "2024-01-04", "1d")
+    assert len(session.calls) == 1
+    assert slept == []
+
+
+def test_requests_after_the_first_wait_the_configured_delay(monkeypatch):
+    monkeypatch.delenv("ALPACA_REQUEST_DELAY", raising=False)
+    pages = {
+        None: {"bars": {"AAPL": [_bar("2024-01-02T05:00:00Z", 10)]}, "next_page_token": "page-2"},
+        "page-2": {"bars": {"AAPL": [_bar("2024-01-03T05:00:00Z", 11)]}, "next_page_token": None},
+    }
+    slept = []
+    monkeypatch.setattr("src.data.provider._sleep", slept.append)
+    provider, session = _provider(monkeypatch, pages, request_delay=None)
+    provider.get_bars("AAPL", "2024-01-01", "2024-01-04", "1d")
+    assert slept == [ALPACA_REQUEST_DELAY_SECONDS]
+    assert ALPACA_REQUEST_DELAY_SECONDS == 0.3
+    assert len(session.calls) == 2
+
+    monkeypatch.setenv("ALPACA_REQUEST_DELAY", "0.05")
+    slept.clear()
+    provider, _session = _provider(monkeypatch, pages, request_delay=None)
+    provider.get_bars("AAPL", "2024-01-01", "2024-01-04", "1d")
+    assert slept == [0.05]
 
 
 def test_daily_weekday_is_in_session_and_weekend_is_not():
