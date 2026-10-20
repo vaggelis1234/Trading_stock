@@ -240,7 +240,7 @@ def test_metric_dropdown_uses_athens_time_and_leaves_nulls_empty():
     assert "03/06 21:30" not in " ".join(metric_snapshot_options(rows, "Score"))
 
 
-def test_off_hour_scan_covers_its_clock_hour_without_hiding_history():
+def test_coverage_expects_session_windows_not_closed_hours():
     anchor = "2024-06-03T17:02:00+00:00"
     rows = [
         _row(scan_timestamp="2024-06-03T15:00:00+00:00", rsi14=40.0),
@@ -248,13 +248,17 @@ def test_off_hour_scan_covers_its_clock_hour_without_hiding_history():
         _row(scan_timestamp=anchor, rsi14=60.0),
     ]
     coverage = metric_coverage(rows, "RSI", anchor, "24H")
-    assert coverage["expected"][-1] == "2024-06-03T17:00:00+00:00"
-    assert coverage["actual"][-1] == anchor
-    assert anchor not in coverage["missing"]
-    assert "2024-06-03T17:00:00+00:00" not in coverage["missing"]
-    assert "2024-06-03T16:00:00+00:00" not in coverage["missing"]
-    assert "2024-06-03T15:00:00+00:00" not in coverage["missing"]
-    assert "2024-06-03T14:00:00+00:00" in coverage["missing"]
+    assert coverage["expected"] == [
+        "2024-06-03T13:30:00+00:00",
+        "2024-06-03T14:30:00+00:00",
+        "2024-06-03T15:30:00+00:00",
+    ]
+    assert coverage["actual"] == [
+        "2024-06-03T14:30:00+00:00",
+        "2024-06-03T15:30:00+00:00",
+    ]
+    assert coverage["missing"] == ["2024-06-03T13:30:00+00:00"]
+    assert "2024-06-02T22:00:00+00:00" not in coverage["expected"]
     assert history_start(anchor, "24H") == "2024-06-02T17:00:00+00:00"
 
 
@@ -265,22 +269,25 @@ def test_metric_coverage_separates_missing_snapshots_from_null_values():
         _row(scan_timestamp="2024-06-03T18:00:00+00:00", rsi14=60.0, final_score=7.0),
     ]
     rsi = metric_coverage(rows, "RSI", anchor, "24H")
-    assert rsi["expected"][0] == "2024-06-02T18:00:00+00:00"
-    assert rsi["expected"][-1] == anchor
-    assert len(rsi["expected"]) == 25
-    assert rsi["actual"] == [
-        "2024-06-03T16:00:00+00:00",
-        "2024-06-03T18:00:00+00:00",
+    assert rsi["expected"] == [
+        "2024-06-03T13:30:00+00:00",
+        "2024-06-03T14:30:00+00:00",
+        "2024-06-03T15:30:00+00:00",
+        "2024-06-03T16:30:00+00:00",
     ]
-    assert "2024-06-03T17:00:00+00:00" in rsi["missing"]
-    assert "2024-06-03T16:00:00+00:00" not in rsi["missing"]
+    assert rsi["actual"] == ["2024-06-03T15:30:00+00:00"]
+    assert rsi["missing"] == [
+        "2024-06-03T13:30:00+00:00",
+        "2024-06-03T14:30:00+00:00",
+        "2024-06-03T16:30:00+00:00",
+    ]
     assert rsi["null_metric"] == []
 
     score = metric_coverage(rows, "Score", anchor, "24H")
     assert score["missing"] == rsi["missing"]
-    assert score["null_metric"] == ["2024-06-03T16:00:00+00:00"]
-    assert len(metric_coverage(rows, "Volume Ratio", anchor, "3D")["expected"]) == 73
-    assert len(metric_coverage(rows, "ATR%", anchor, "5D")["expected"]) == 121
+    assert score["null_metric"] == ["2024-06-03T15:30:00+00:00"]
+    assert len(metric_coverage(rows, "Volume Ratio", anchor, "3D")["expected"]) == 6
+    assert len(metric_coverage(rows, "ATR%", anchor, "5D")["expected"]) == 20
 
 
 def test_timestamps_display_in_europe_athens():

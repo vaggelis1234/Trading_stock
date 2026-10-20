@@ -17,12 +17,20 @@ class UniverseResolutionError(RuntimeError):
     """The S&P 500 constituent list could not be resolved."""
 
 
-def _symbol_column(frame: pd.DataFrame):
+def _named_column(frame: pd.DataFrame, title: str):
     for column in frame.columns:
         name = column[-1] if isinstance(column, tuple) else column
-        if str(name).strip() == "Symbol":
+        if str(name).strip() == title:
             return column
     return None
+
+
+def _symbol_column(frame: pd.DataFrame):
+    return _named_column(frame, "Symbol")
+
+
+def _security_column(frame: pd.DataFrame):
+    return _named_column(frame, "Security")
 
 
 def yahoo_symbol(symbol: str) -> str:
@@ -46,6 +54,44 @@ def _clean_symbols(values) -> List[str]:
         seen.add(symbol)
         symbols.append(symbol)
     return symbols
+
+
+def _security_name(value) -> Optional[str]:
+    if value is None or pd.isna(value):
+        return None
+    name = str(value).strip()
+    if not name or name.upper() == "NAN":
+        return None
+    return name
+
+
+def names_from_constituent_tables(tables) -> dict:
+    """Map each constituent ticker to its Security name.
+
+    The longest table that has both Symbol and Security wins. A short table
+    is rejected. Share classes use the same ticker form as the scan.
+    """
+    best: dict = {}
+    for table in tables:
+        symbol_column = _symbol_column(table)
+        security_column = _security_column(table)
+        if symbol_column is None or security_column is None:
+            continue
+        mapping: dict = {}
+        for raw_symbol, raw_name in zip(table[symbol_column].tolist(), table[security_column].tolist()):
+            symbol = yahoo_symbol(raw_symbol) if raw_symbol is not None and not pd.isna(raw_symbol) else ""
+            name = _security_name(raw_name)
+            if not symbol or symbol == "NAN" or name is None or symbol in mapping:
+                continue
+            mapping[symbol] = name
+        if len(mapping) > len(best):
+            best = mapping
+    if len(best) < FULL_UNIVERSE_MIN_SYMBOLS:
+        raise UniverseResolutionError(
+            f"Constituent table has {len(best)} company names, which is not the full S&P 500 universe. "
+            "No sample list was substituted."
+        )
+    return best
 
 
 def symbols_from_constituent_tables(tables) -> List[str]:
@@ -77,6 +123,21 @@ def _download_constituent_html(url: str = SP500_CONSTITUENTS_URL) -> str:
     )
     response.raise_for_status()
     return response.text
+
+
+def fetch_sp500_names() -> dict:
+    """Return ticker to Security name for the current S&P 500 list."""
+    try:
+        html = _download_constituent_html()
+        tables = pd.read_html(io.StringIO(html))
+        return names_from_constituent_tables(tables)
+    except UniverseResolutionError:
+        raise
+    except Exception as exc:
+        raise UniverseResolutionError(
+            "S&P 500 constituent fetch failed. No sample list was substituted. "
+            f"Cause: {exc}"
+        ) from exc
 
 
 def fetch_sp500_symbols() -> List[str]:

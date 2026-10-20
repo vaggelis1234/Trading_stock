@@ -4,10 +4,12 @@ import pandas as pd
 import pytest
 import requests
 
+from src.data.company_names import company_name
 from src.data.scan import (
     FULL_UNIVERSE_MIN_SYMBOLS,
     UniverseResolutionError,
     fetch_sp500_symbols,
+    names_from_constituent_tables,
     symbols_from_constituent_tables,
     yahoo_symbol,
 )
@@ -78,6 +80,37 @@ def test_short_table_is_not_treated_as_the_full_universe():
         symbols_from_constituent_tables([frame])
     assert "No sample list was substituted" in str(caught.value)
     assert "FB" not in str(caught.value)
+
+
+def _named_frame(count):
+    symbols = _symbols(count)
+    names = [f"Company {index}" for index in range(count)]
+    names[0] = "Berkshire Hathaway"
+    return pd.DataFrame({"Symbol": symbols, "Security": names, "GICS Sector": ["X"] * count})
+
+
+def test_constituent_names_follow_the_security_column():
+    resolved = names_from_constituent_tables(
+        [
+            pd.DataFrame({"Symbol": ["AAPL"], "Security": ["Too short"]}),
+            _named_frame(FULL_UNIVERSE_MIN_SYMBOLS),
+        ]
+    )
+    assert resolved["BRK-B"] == "Berkshire Hathaway"
+    assert resolved["META"] == "Company 1"
+    assert len(resolved) == FULL_UNIVERSE_MIN_SYMBOLS
+
+
+def test_short_name_table_is_not_the_full_universe():
+    frame = pd.DataFrame({"Symbol": ["ACN"], "Security": ["Accenture"]})
+    with pytest.raises(UniverseResolutionError, match="company names"):
+        names_from_constituent_tables([frame])
+
+
+def test_shipped_names_include_accenture():
+    assert company_name("ACN") == "Accenture"
+    assert company_name("aapl") == "Apple Inc."
+    assert company_name("NOPE") is None
 
 
 def test_yahoo_symbol_normalizes_share_classes_and_leaves_plain_tickers():

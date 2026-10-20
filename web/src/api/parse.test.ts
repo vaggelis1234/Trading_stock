@@ -72,6 +72,7 @@ describe("API response parsing", () => {
   it("keeps LOOKBACK history distinct from the operational CURRENT scan", () => {
     const view = parseSymbolView({
       symbol: "AAPL",
+      name: "Apple Inc.",
       scan_timestamp: "2026-10-09T17:02:00+00:00",
       executed_at: "2026-10-09T17:02:10+00:00",
       run_id: "run-a",
@@ -104,6 +105,7 @@ describe("API response parsing", () => {
           status: "BLOCKED",
           reasons: ["VolumeRatio < 0.8"],
           veto_reasons: ["BLOCKED_VOLUME"],
+          price: 100,
           rsi14: null,
           final_score: 4.5,
           atr_percent: null,
@@ -118,6 +120,7 @@ describe("API response parsing", () => {
       },
     });
     expect(view.snapshot_kind).toBe("CURRENT");
+    expect(view.name).toBe("Apple Inc.");
     expect(view.history[0].snapshot_kind).toBe("LOOKBACK");
     expect(view.detail.atr_percent).toBeNull();
     expect(view.enrichment).toBeNull();

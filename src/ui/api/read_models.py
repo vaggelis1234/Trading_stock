@@ -11,6 +11,7 @@ from typing import Any, Mapping, Optional, Sequence
 
 from src.persistence.store import SNAPSHOT_CURRENT, _parse_snapshot
 from src.ui.api.db import connect_readonly
+from src.data.company_names import company_name
 from src.ui.universe_view import (
     METRIC_FIELDS,
     TOP_N,
@@ -83,6 +84,7 @@ def symbol_payload(path: str, symbol: str, range_key: str) -> dict[str, Any]:
         rank = current.get("rank")
         return {
             "symbol": symbol,
+            "name": company_name(symbol),
             "scan_timestamp": current["scan_timestamp"],
             "executed_at": current.get("executed_at"),
             "run_id": current.get("run_id"),
@@ -336,6 +338,7 @@ def _history_row(row: Mapping[str, Any]) -> dict[str, Any]:
         "status": display_status(row.get("veto_status")),
         "reasons": [reason_text(code) for code in reasons],
         "veto_reasons": reasons,
+        "price": _number(row.get("hourly_close")),
         "rsi14": _number(row.get("rsi14")),
         "final_score": _number(row.get("final_score")),
         "atr_percent": _atr_points(row.get("atr_percent")),

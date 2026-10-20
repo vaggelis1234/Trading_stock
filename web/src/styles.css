@@ -53,6 +53,7 @@ button, input, select { font: inherit; color: inherit; }
 .main { flex: 1; padding: 24px; min-width: 0; }
 .page-head, .chart-card header { display: flex; justify-content: space-between; gap: 12px; align-items: flex-start; }
 h1, h2, h3 { margin: 0 0 8px; font-weight: 600; }
+.company-name { color: var(--muted); font-weight: 500; }
 .counters, .detail-grid, .coverage-grid, .chart-grid {
   display: grid;
   gap: 12px;
@@ -65,7 +66,8 @@ h1, h2, h3 { margin: 0 0 8px; font-weight: 600; }
 }
 .detail-grid > .counter { flex: 0 0 auto; min-width: 140px; }
 .detail-grid .counter strong { white-space: nowrap; }
-.chart-grid, .coverage-grid { grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); }
+.chart-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+.coverage-grid { grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); }
 .counter, .panel, .chart-card, .state-card {
   background: var(--panel);
   border: 1px solid var(--line);
@@ -121,7 +123,19 @@ button:disabled { opacity: 0.45; cursor: default; }
 .symbol-link { font-family: Consolas, monospace; text-decoration: none; }
 tr.lookback { color: #b7c0c9; }
 tr.decision { color: #fff; }
-.chart-card svg { width: 100%; height: 180px; color: var(--accent); }
+.chart-card { padding: 10px 12px; }
+.chart-card h3 { font-size: 15px; margin-bottom: 2px; }
+.chart-card svg { width: 100%; height: 210px; display: block; touch-action: none; }
+.chart-tools { display: flex; gap: 6px; }
+.chart-tools button { padding: 4px 10px; }
+.metric-chart { cursor: grab; }
+.chart-axis { fill: var(--muted); font-size: 11px; font-family: Consolas, monospace; }
+.chart-frame, .chart-gridline { stroke: var(--line); stroke-width: 1; }
+.chart-half { fill: rgba(230, 192, 123, 0.24); stroke: #e6c07b; stroke-width: 1.5; }
+.chart-half-label { fill: #e6c07b; font-size: 11px; font-family: Consolas, monospace; font-weight: 700; }
+.chart-line { fill: none; stroke: var(--accent); stroke-width: 2; }
+.chart-hover { stroke: #d5e4f5; stroke-dasharray: 3 3; }
+.chart-hit { fill: transparent; }
 .dot.decision { fill: #fff; }
 .dot.lookback { fill: #7eb6ff; }
 .facts { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 8px; }
@@ -139,4 +153,6 @@ ul { margin: 8px 0 0; padding-left: 18px; }
   .sidebar-note { margin-top: 0; }
   .main { padding: 16px; }
   .counter strong { font-size: 18px; }
+  .chart-grid { grid-template-columns: 1fr; }
+  .chart-card svg { height: 240px; }
 }

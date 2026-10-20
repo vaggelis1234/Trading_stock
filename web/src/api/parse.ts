@@ -77,6 +77,7 @@ export function parseSymbolView(value: unknown): SymbolView {
   }
   return {
     symbol: text(body, "symbol"),
+    name: textOrNull(body, "name"),
     scan_timestamp: text(body, "scan_timestamp"),
     executed_at: textOrNull(body, "executed_at"),
     run_id: textOrNull(body, "run_id"),
@@ -140,6 +141,7 @@ function parseHistory(value: unknown): HistoryPoint {
     status: status(body.status),
     reasons: stringList(body, "reasons"),
     veto_reasons: stringList(body, "veto_reasons"),
+    price: numberOrNull(body, "price"),
     rsi14: numberOrNull(body, "rsi14"),
     final_score: numberOrNull(body, "final_score"),
     atr_percent: numberOrNull(body, "atr_percent"),

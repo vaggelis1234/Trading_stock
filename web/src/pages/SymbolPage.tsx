@@ -1,10 +1,10 @@
 import { useEffect, useState } from "react";
 import { fetchSymbol } from "../api/client";
 import type { HistoryRange, SymbolView } from "../api/types";
-import type { ChartPoint } from "../charts";
+import { sessionWindowLabel, type ChartPoint } from "../charts";
 import { MetricChart } from "../components/MetricChart";
 import { EmptyState, ErrorState, LoadingState } from "../components/States";
-import { formatAdv, formatAthens, formatNumber, movementText, snapshotLabel, snapshotRole } from "../format";
+import { formatAdv, formatAthens, formatNewYork, formatNumber, movementText, snapshotLabel, snapshotRole } from "../format";
 
 const RANGES: HistoryRange[] = ["24H", "3D", "5D"];
 
@@ -41,18 +41,22 @@ export function SymbolPage({ symbol }: { symbol: string }) {
   if (!view) return <EmptyState title="Δεν υπάρχουν δεδομένα για αυτό το σύμβολο." />;
 
   const detail = view.detail;
-  const charts: Array<{ title: string; field: "rsi14" | "final_score" | "atr_percent" | "volume_ratio" }> = [
-    { title: "RSI", field: "rsi14" },
-    { title: "Score", field: "final_score" },
-    { title: "ATR%", field: "atr_percent" },
-    { title: "Volume Ratio", field: "volume_ratio" },
+  const charts: Array<{ title: string; field: "rsi14" | "final_score" | "atr_percent" | "volume_ratio" | "price"; digits: number }> = [
+    { title: "RSI", field: "rsi14", digits: 1 },
+    { title: "Score", field: "final_score", digits: 2 },
+    { title: "ATR%", field: "atr_percent", digits: 2 },
+    { title: "Volume Ratio", field: "volume_ratio", digits: 2 },
+    { title: "Price", field: "price", digits: 2 },
   ];
 
   return (
     <section>
       <header className="page-head">
         <div>
-          <h1>{view.symbol}</h1>
+          <h1>
+            {view.symbol}
+            {view.name ? <span className="company-name"> ({view.name})</span> : null}
+          </h1>
           <p className="muted">
             Operational scan {formatAthens(view.scan_timestamp)} · Executed {formatAthens(view.executed_at)} ·{" "}
             {snapshotRole(view.snapshot_kind) === "legacy" ? "Legacy scan, no run identity" : "CURRENT decision"}
@@ -96,7 +100,7 @@ export function SymbolPage({ symbol }: { symbol: string }) {
       </div>
       <div className="chart-grid">
         {charts.map((chart) => (
-          <MetricChart key={chart.title} title={chart.title} points={toPoints(view, chart.field)} />
+          <MetricChart key={chart.title} title={chart.title} points={toPoints(view, chart.field)} digits={chart.digits} />
         ))}
       </div>
       <section className="panel">
@@ -108,14 +112,14 @@ export function SymbolPage({ symbol }: { symbol: string }) {
               <article key={name}>
                 <h3>{name}</h3>
                 <p>
-                  Expected {item.expected.length} · present {item.actual.length} · missing {item.missing.length} · null{" "}
+                  Session bars {item.actual.length}/{item.expected.length} · missing {item.missing.length} · null{" "}
                   {item.null_metric.length}
                 </p>
                 {item.missing.length > 0 || item.null_metric.length > 0 ? (
                   <details>
                     <summary>Gaps</summary>
-                    {item.missing.length > 0 ? <p className="muted">Missing: {item.missing.map(formatAthens).join(", ")}</p> : null}
-                    {item.null_metric.length > 0 ? <p className="muted">Null: {item.null_metric.map(formatAthens).join(", ")}</p> : null}
+                    {item.missing.length > 0 ? <p className="muted">Missing: {item.missing.map(sessionWindowLabel).join(", ")}</p> : null}
+                    {item.null_metric.length > 0 ? <p className="muted">Null: {item.null_metric.map(sessionWindowLabel).join(", ")}</p> : null}
                   </details>
                 ) : null}
               </article>
@@ -129,7 +133,7 @@ export function SymbolPage({ symbol }: { symbol: string }) {
           <table className="scan-table">
             <thead>
               <tr>
-                <th>Time</th>
+                <th>Time (New York)</th>
                 <th>Kind</th>
                 <th>Status</th>
                 <th>Reason</th>
@@ -138,7 +142,7 @@ export function SymbolPage({ symbol }: { symbol: string }) {
             <tbody>
               {view.history.map((row) => (
                 <tr key={row.scan_timestamp} className={snapshotRole(row.snapshot_kind)}>
-                  <td>{formatAthens(row.scan_timestamp)}</td>
+                  <td>{formatNewYork(row.scan_timestamp)}</td>
                   <td>{snapshotLabel(row.snapshot_kind)}</td>
                   <td>{row.status}</td>
                   <td>{row.reasons.length ? row.reasons.join("; ") : "—"}</td>
@@ -176,10 +180,11 @@ function Fact({ label, value }: { label: string; value: string }) {
   );
 }
 
-function toPoints(view: SymbolView, field: "rsi14" | "final_score" | "atr_percent" | "volume_ratio"): ChartPoint[] {
+function toPoints(view: SymbolView, field: "rsi14" | "final_score" | "atr_percent" | "volume_ratio" | "price"): ChartPoint[] {
   return view.history.map((row) => ({
     label: formatAthens(row.scan_timestamp),
     value: row[field],
     kind: row.snapshot_kind,
+    at: row.scan_timestamp,
   }));
 }

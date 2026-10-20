@@ -51,10 +51,10 @@ export function Dashboard({ onOpen }: { onOpen: (symbol: string) => void }) {
         <p className="banner">Το earnings veto δεν εφαρμόζεται. Ο έλεγχος ημερομηνιών είναι unavailable.</p>
       ) : null}
       <div className="counters">
-        <Counter label="Evaluated" value={scan.evaluated} />
-        <Counter label="Scored" value={scan.scored} />
-        <Counter label="PASS" value={scan.passed} />
-        <Counter label="BLOCKED" value={scan.blocked} />
+        <Counter label="Evaluated" value={scan.rows.length} />
+        <Counter label="Scored" value={scan.rows.filter((row) => row.score !== null).length} />
+        <Counter label="PASS" value={scan.rows.filter((row) => row.status === "PASS").length} />
+        <Counter label="BLOCKED" value={scan.rows.filter((row) => row.status === "BLOCKED").length} />
       </div>
       {scan.rows.length === 0 ? (
         <EmptyState title="Δεν υπάρχουν ranked μετοχές σε αυτό το scan." />

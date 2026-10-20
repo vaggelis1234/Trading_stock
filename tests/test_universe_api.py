@@ -459,10 +459,11 @@ def test_symbol_history_covers_1702_scan_as_the_1700_hour(tmp_path, monkeypatch)
     assert body["history"][0]["rsi14"] is None
     assert body["history"][0]["atr_percent"] is None
     coverage = body["coverage"]["RSI"]
-    assert coverage["expected"][-1] == "2026-10-09T17:00:00+00:00"
+    assert coverage["expected"][-1] == "2026-10-09T15:30:00+00:00"
     assert "2026-10-09T17:02:00+00:00" not in coverage["expected"]
-    assert "2026-10-09T17:00:00+00:00" not in coverage["missing"]
-    assert null_hour in coverage["null_metric"]
+    assert "2026-10-08T17:30:00+00:00" in coverage["expected"]
+    assert "2026-10-09T14:30:00+00:00" in coverage["null_metric"]
+    assert null_hour not in coverage["expected"]
     assert body["enrichment"] is None
     assert client.get("/api/v1/symbols/AAPL", params={"range": "2D"}).status_code == 422
 
@@ -589,9 +590,11 @@ def test_json_contract_matches_frontend_types(tmp_path, monkeypatch):
     }
     detail = client.get("/api/v1/symbols/AAPL", params={"range": "24H"}).json()
     assert detail["snapshot_kind"] == "CURRENT"
+    assert detail["name"] == "Apple Inc."
     assert detail["history"][0]["snapshot_kind"] == "LOOKBACK"
     assert set(detail) == {
         "symbol",
+        "name",
         "scan_timestamp",
         "executed_at",
         "run_id",
@@ -628,11 +631,13 @@ def test_json_contract_matches_frontend_types(tmp_path, monkeypatch):
         "status",
         "reasons",
         "veto_reasons",
+        "price",
         "rsi14",
         "final_score",
         "atr_percent",
         "volume_ratio",
     }
+    assert detail["history"][0]["price"] == 100.0
     assert set(detail["coverage"]) == {"RSI", "Score", "ATR%", "Volume Ratio"}
     assert set(detail["coverage"]["RSI"]) == {"expected", "actual", "missing", "null_metric"}
     assert detail["history"][0]["rsi14"] is None

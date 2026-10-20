@@ -85,6 +85,7 @@ export interface HistoryPoint {
   status: ScanStatus;
   reasons: string[];
   veto_reasons: string[];
+  price: number | null;
   rsi14: number | null;
   final_score: number | null;
   atr_percent: number | null;
@@ -102,6 +103,7 @@ export type CoverageMap = Record<"RSI" | "Score" | "ATR%" | "Volume Ratio", Metr
 
 export interface SymbolView {
   symbol: string;
+  name: string | null;
   scan_timestamp: string;
   executed_at: string | null;
   run_id: string | null;

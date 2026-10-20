@@ -1,10 +1,13 @@
 """Display frames for the Universe v1 table, rank movement, and history."""
 
+from datetime import timedelta
 from typing import Mapping, Optional, Sequence
 
 import pandas as pd
 
+from src.market.calendar import NyseCalendar
 from src.universe.metrics import to_utc_iso
+from src.universe.schedule import FINAL, SLOT_GRACE, as_new_york, session_slots
 from src.universe.ranking import TOP_N
 from src.universe.veto import (
     ADV20_MIN,
@@ -41,8 +44,6 @@ METRIC_FIELDS = {
     "ATR%": "atr_percent",
     "Volume Ratio": "volume_ratio",
 }
-SNAPSHOT_STEP = pd.Timedelta(hours=1)
-
 HISTORY_RANGES = {
     "24H": pd.Timedelta(hours=24),
     "3D": pd.Timedelta(days=3),
@@ -319,40 +320,89 @@ def metric_snapshot_options(rows: Sequence[Mapping], metric: str) -> list[str]:
 
 
 def expected_snapshot_timestamps(anchor, range_key: str = DEFAULT_HISTORY_RANGE) -> list[str]:
-    """Hourly UTC timestamps from the range start through the anchor hour.
+    """Session-window starts that should already be stored, oldest first.
 
-    The current scan may sit at ``17:02``. That row covers the ``17:00`` hour.
-    It does not move the historical grid onto the ``:02`` minute.
+    A regular cash day is six 60-minute windows from 09:30 and one closing
+    half hour, 15:30–16:00, America/New_York. Weekends, holidays, and windows
+    whose scan is still after ``anchor`` are not expected. An early close
+    keeps only the windows that finish by that close.
     """
-    start = pd.Timestamp(history_start(anchor, range_key))
-    end = _hour_floor(anchor)
+    start = _as_utc(history_start(anchor, range_key))
+    moment = _as_utc(anchor)
+    calendar = NyseCalendar()
     stamps = []
-    cursor = start
-    while cursor <= end:
-        stamps.append(to_utc_iso(cursor))
-        cursor = cursor + SNAPSHOT_STEP
+    day = start.tz_convert("America/New_York").date()
+    last = moment.tz_convert("America/New_York").date()
+    while day <= last:
+        session = calendar.session(day)
+        if session is not None:
+            for slot in session_slots(session):
+                window_start = slot.window_start.tz_convert("UTC")
+                if window_start < start:
+                    continue
+                if slot.scan_at.tz_convert("UTC") > moment:
+                    continue
+                stamps.append(to_utc_iso(window_start))
+        day += timedelta(days=1)
     return stamps
 
 
-def _stored_stamp(value) -> str:
-    return to_utc_iso(value)
+def snapshot_window_start(value) -> Optional[str]:
+    """Session window a stored snapshot belongs to, or None outside the cash session.
+
+    A print inside 09:30–10:30 belongs to that window. A scan clock within
+    five minutes after 10:45 still belongs to 09:30–10:30, not to the next
+    hour. The 16:00 print belongs to the closing half hour.
+    """
+    ny = as_new_york(_as_utc(value))
+    slots = session_slots(NyseCalendar().session(ny.date()))
+    if not slots:
+        return None
+    for slot in slots:
+        if slot.scan_at <= ny < slot.scan_at + SLOT_GRACE:
+            return to_utc_iso(slot.window_start)
+    for slot in slots:
+        if slot.window_start <= ny < slot.window_end:
+            return to_utc_iso(slot.window_start)
+        if slot.kind == FINAL and ny == slot.window_end:
+            return to_utc_iso(slot.window_start)
+    return None
+
+
+def _as_utc(value) -> pd.Timestamp:
+    stamp = pd.Timestamp(to_utc_iso(value))
+    if stamp.tzinfo is None:
+        return stamp.tz_localize("UTC")
+    return stamp.tz_convert("UTC")
 
 
 def metric_coverage(rows: Sequence[Mapping], metric: str, anchor, range_key: str = DEFAULT_HISTORY_RANGE) -> dict:
-    """Compare the hourly range clock with the snapshots already loaded.
+    """Compare stored snapshots with the session windows the range should hold.
 
-    ``missing`` is an expected hour with no snapshot row. ``null_metric`` is a
-    stored snapshot whose value for this metric is null. Those are different
-    gaps: one has no row, the other has a row and an empty metric.
+    ``expected`` is one timestamp per window, its left edge in UTC. ``actual``
+    is the subset that has a snapshot. ``missing`` is the rest. ``null_metric``
+    is a covered window whose value for this metric is null. Several stored
+    rows in one window count as one bar; the row nearest the window start wins.
     """
     expected = expected_snapshot_timestamps(anchor, range_key)
-    actual = [_stored_stamp(row["scan_timestamp"]) for row in rows]
-    present_hours = {_hour_floor(stamp) for stamp in actual}
-    missing = [stamp for stamp in expected if _hour_floor(stamp) not in present_hours]
+    expected_set = set(expected)
+    covered: dict[str, tuple[pd.Timestamp, Mapping]] = {}
+    for row in rows:
+        window = snapshot_window_start(row["scan_timestamp"])
+        if window is None or window not in expected_set:
+            continue
+        stored_at = _as_utc(row["scan_timestamp"])
+        window_at = _as_utc(window)
+        distance = abs(stored_at - window_at)
+        current = covered.get(window)
+        if current is None or distance < current[0] or (distance == current[0] and stored_at >= _as_utc(current[1]["scan_timestamp"])):
+            covered[window] = (distance, row)
+    actual = [stamp for stamp in expected if stamp in covered]
+    missing = [stamp for stamp in expected if stamp not in covered]
     null_metric = [
-        _stored_stamp(row["scan_timestamp"])
-        for row in rows
-        if metric_display_value(row, metric) is None
+        stamp
+        for stamp in actual
+        if metric_display_value(covered[stamp][1], metric) is None
     ]
     return {
         "expected": expected,
@@ -364,9 +414,9 @@ def metric_coverage(rows: Sequence[Mapping], metric: str, anchor, range_key: str
 
 def format_metric_coverage_summary(coverage: Mapping, metric: str) -> str:
     return (
-        f"Expected {len(coverage['expected'])} · "
+        f"Expected {len(coverage['expected'])} session bars · "
         f"present {len(coverage['actual'])} · "
-        f"missing snapshots {len(coverage['missing'])} · "
+        f"missing {len(coverage['missing'])} · "
         f"null {metric} {len(coverage['null_metric'])}"
     )
 
