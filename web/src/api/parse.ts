@@ -7,6 +7,7 @@ import type {
   MovementLabel,
   ScanRow,
   ScanStatus,
+  BarInterval,
   SnapshotKind,
   SymbolDetail,
   SymbolSearch,
@@ -47,6 +48,7 @@ export function parseLatestScan(value: unknown): LatestScan {
     executed_at: textOrNull(body, "executed_at"),
     run_id: textOrNull(body, "run_id"),
     snapshot_kind: kind(body.snapshot_kind),
+    bar_interval: barInterval(body.bar_interval),
     evaluated: integer(body, "evaluated"),
     scored: integer(body, "scored"),
     passed: integer(body, "passed"),
@@ -62,6 +64,7 @@ export function parseSymbolSearch(value: unknown): SymbolSearch {
     scan_timestamp: text(body, "scan_timestamp"),
     run_id: textOrNull(body, "run_id"),
     snapshot_kind: kind(body.snapshot_kind),
+    bar_interval: barInterval(body.bar_interval),
     total: integer(body, "total"),
     limit: integer(body, "limit"),
     offset: integer(body, "offset"),
@@ -82,6 +85,7 @@ export function parseSymbolView(value: unknown): SymbolView {
     executed_at: textOrNull(body, "executed_at"),
     run_id: textOrNull(body, "run_id"),
     snapshot_kind: kind(body.snapshot_kind),
+    bar_interval: barInterval(body.bar_interval),
     range,
     since: text(body, "since"),
     detail: parseDetail(body.detail),
@@ -138,6 +142,7 @@ function parseHistory(value: unknown): HistoryPoint {
     scan_timestamp: text(body, "scan_timestamp"),
     run_id: textOrNull(body, "run_id"),
     snapshot_kind: kind(body.snapshot_kind),
+    bar_interval: barInterval(body.bar_interval),
     status: status(body.status),
     reasons: stringList(body, "reasons"),
     veto_reasons: stringList(body, "veto_reasons"),
@@ -251,6 +256,11 @@ function movement(value: unknown): MovementLabel {
     return value;
   }
   throw new ResponseShapeError("movement_label");
+}
+
+function barInterval(value: unknown): BarInterval {
+  if (value === undefined || value === null || value === "" || value === "30m") return "30m";
+  throw new ResponseShapeError("bar_interval");
 }
 
 function kind(value: unknown): SnapshotKind {

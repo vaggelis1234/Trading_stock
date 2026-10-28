@@ -65,8 +65,8 @@ export function SymbolPage({ symbol }: { symbol: string }) {
         <span className={detail.status === "PASS" ? "pill pass" : "pill blocked"}>{detail.status}</span>
       </header>
       <p className="banner">
-        Μόνο αυτό το scan είναι operational. Οι γραμμές LOOKBACK στο ιστορικό είναι αποθηκευμένες ώρες, όχι ξεχωριστές
-        αποφάσεις.
+        Μόνο αυτό το scan είναι operational. Οι γραμμές LOOKBACK στο ιστορικό είναι αποθηκευμένα 30λεπτα
+        παράθυρα, όχι ξεχωριστές αποφάσεις.
       </p>
       <div className="detail-grid">
         <Fact label="Rank" value={detail.rank === null ? "—" : String(detail.rank)} />
@@ -98,13 +98,21 @@ export function SymbolPage({ symbol }: { symbol: string }) {
           </button>
         ))}
       </div>
-      <div className="chart-grid">
-        {charts.map((chart) => (
-          <MetricChart key={chart.title} title={chart.title} points={toPoints(view, chart.field)} digits={chart.digits} />
-        ))}
-      </div>
       <section className="panel">
-        <h2>Coverage</h2>
+        <h2>30-minute scans</h2>
+        <div className="chart-grid">
+          {charts.map((chart) => (
+            <MetricChart
+              key={chart.title}
+              title={chart.title}
+              points={toPoints(view, chart.field)}
+              digits={chart.digits}
+            />
+          ))}
+        </div>
+      </section>
+      <section className="panel">
+        <h2>Coverage · 30-minute bars</h2>
         <div className="coverage-grid">
           {(Object.keys(view.coverage) as Array<keyof SymbolView["coverage"]>).map((name) => {
             const item = view.coverage[name];
@@ -118,8 +126,8 @@ export function SymbolPage({ symbol }: { symbol: string }) {
                 {item.missing.length > 0 || item.null_metric.length > 0 ? (
                   <details>
                     <summary>Gaps</summary>
-                    {item.missing.length > 0 ? <p className="muted">Missing: {item.missing.map(sessionWindowLabel).join(", ")}</p> : null}
-                    {item.null_metric.length > 0 ? <p className="muted">Null: {item.null_metric.map(sessionWindowLabel).join(", ")}</p> : null}
+                    {item.missing.length > 0 ? <p className="muted">Missing: {item.missing.map((stamp) => sessionWindowLabel(stamp)).join(", ")}</p> : null}
+                    {item.null_metric.length > 0 ? <p className="muted">Null: {item.null_metric.map((stamp) => sessionWindowLabel(stamp)).join(", ")}</p> : null}
                   </details>
                 ) : null}
               </article>
@@ -134,6 +142,7 @@ export function SymbolPage({ symbol }: { symbol: string }) {
             <thead>
               <tr>
                 <th>Time (New York)</th>
+                <th>Bars</th>
                 <th>Kind</th>
                 <th>Status</th>
                 <th>Reason</th>
@@ -143,6 +152,7 @@ export function SymbolPage({ symbol }: { symbol: string }) {
               {view.history.map((row) => (
                 <tr key={row.scan_timestamp} className={snapshotRole(row.snapshot_kind)}>
                   <td>{formatNewYork(row.scan_timestamp)}</td>
+                  <td>30m</td>
                   <td>{snapshotLabel(row.snapshot_kind)}</td>
                   <td>{row.status}</td>
                   <td>{row.reasons.length ? row.reasons.join("; ") : "—"}</td>
@@ -180,11 +190,15 @@ function Fact({ label, value }: { label: string; value: string }) {
   );
 }
 
-function toPoints(view: SymbolView, field: "rsi14" | "final_score" | "atr_percent" | "volume_ratio" | "price"): ChartPoint[] {
+function toPoints(
+  view: SymbolView,
+  field: "rsi14" | "final_score" | "atr_percent" | "volume_ratio" | "price",
+): ChartPoint[] {
   return view.history.map((row) => ({
     label: formatAthens(row.scan_timestamp),
     value: row[field],
     kind: row.snapshot_kind,
     at: row.scan_timestamp,
+    interval: "30m" as const,
   }));
 }

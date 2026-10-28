@@ -14,28 +14,22 @@ export function formatNewYork(value: string | null): string {
 }
 
 const SIP_DELAY_MINUTES = 15;
-/** Session windows, in minutes from midnight New York. The last one is the closing half hour. */
-const SESSION_WINDOWS: ReadonlyArray<readonly [number, number]> = [
-  [9 * 60 + 30, 10 * 60 + 30],
-  [10 * 60 + 30, 11 * 60 + 30],
-  [11 * 60 + 30, 12 * 60 + 30],
-  [12 * 60 + 30, 13 * 60 + 30],
-  [13 * 60 + 30, 14 * 60 + 30],
-  [14 * 60 + 30, 15 * 60 + 30],
-  [15 * 60 + 30, 16 * 60],
-];
 
-/**
- * Latest session window whose SIP print is available at the scan.
- * A window ending at 13:30 can be read from 13:45, so a 13:30 scan still shows 11:30-12:30.
- */
-export function formatNewYorkPeriod(value: string | null): string {
+/** Completed 30-minute cash windows, in minutes from midnight New York. */
+const HALF_HOUR_WINDOWS: ReadonlyArray<readonly [number, number]> = Array.from({ length: 13 }, (_, index) => {
+  const start = 9 * 60 + 30 + index * 30;
+  return [start, start + 30] as const;
+});
+
+export function formatNewYorkPeriod(value: string | null, interval: "30m" = "30m"): string {
   const parts = zonedParts(value, NEW_YORK);
   if (!parts) return "—";
   const clock = Number(parts.hour) * 60 + Number(parts.minute);
   if (!Number.isInteger(clock)) return "—";
+  void interval;
+  const windows = HALF_HOUR_WINDOWS;
   let ready: readonly [number, number] | null = null;
-  for (const sessionWindow of SESSION_WINDOWS) {
+  for (const sessionWindow of windows) {
     if (clock >= sessionWindow[1] + SIP_DELAY_MINUTES) ready = sessionWindow;
   }
   if (!ready) return "—";

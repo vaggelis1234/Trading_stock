@@ -4,6 +4,8 @@ export interface ChartPoint {
   kind: "CURRENT" | "LOOKBACK" | null;
   /** ISO timestamp of the stored snapshot. Session charts ignore points without one. */
   at?: string;
+  /** Universe charts use completed 30-minute scans. */
+  interval?: "30m";
 }
 
 export interface PlottedPoint {
@@ -57,16 +59,15 @@ interface SessionWindow {
   key: string;
 }
 
-/** Regular cash session. Six hours from 09:30, then the 15:30–16:00 half hour. */
-const SESSION_WINDOWS: SessionWindow[] = [
-  { start: 9 * 60 + 30, end: 10 * 60 + 30, weight: 1, label: "9:30", key: "09:30" },
-  { start: 10 * 60 + 30, end: 11 * 60 + 30, weight: 1, label: "10:30", key: "10:30" },
-  { start: 11 * 60 + 30, end: 12 * 60 + 30, weight: 1, label: "11:30", key: "11:30" },
-  { start: 12 * 60 + 30, end: 13 * 60 + 30, weight: 1, label: "12:30", key: "12:30" },
-  { start: 13 * 60 + 30, end: 14 * 60 + 30, weight: 1, label: "13:30", key: "13:30" },
-  { start: 14 * 60 + 30, end: 15 * 60 + 30, weight: 1, label: "14:30", key: "14:30" },
-  { start: 15 * 60 + 30, end: 16 * 60, weight: 0.5, label: "15:30", key: "15:30" },
-];
+/** Cash session. Thirteen completed 30-minute bars from 09:30 through 15:30. */
+const HALF_HOUR_WINDOWS: SessionWindow[] = Array.from({ length: 13 }, (_, index) => {
+  const start = 9 * 60 + 30 + index * 30;
+  const end = start + 30;
+  const hour = Math.floor(start / 60);
+  const minute = start % 60;
+  const label = `${hour}:${String(minute).padStart(2, "0")}`;
+  return { start, end, weight: 1, label, key: label };
+});
 
 export interface TimeSlot {
   at: string | null;
@@ -109,13 +110,15 @@ interface Bucket {
  * and last print of a day stays empty so the axis does not skip it. Several
  * prints in one window collapse to the one nearest the window start.
  */
-export function sessionTimeSlots(points: ChartPoint[]): TimeSlot[] {
+export function sessionTimeSlots(points: ChartPoint[], interval: "30m" = "30m"): TimeSlot[] {
+  const windows = HALF_HOUR_WINDOWS;
+  const selected = points.filter((point) => (point.interval ?? interval) === "30m");
   const buckets = new Map<string, Bucket>();
-  for (const point of points) {
+  for (const point of selected) {
     if (!point.at) continue;
     const ny = nyParts(point.at);
     if (!ny) continue;
-    const placed = classifyWindow(ny.minutes);
+    const placed = classifyWindow(ny.minutes, windows);
     if (!placed) continue;
     const key = `${ny.dateKey}|${placed.window.key}`;
     const instant = Date.parse(point.at);
@@ -146,11 +149,11 @@ export function sessionTimeSlots(points: ChartPoint[]): TimeSlot[] {
   for (const dateKey of [...byDate.keys()].sort()) {
     const day = byDate.get(dateKey) ?? [];
     const byKey = new Map(day.map((bucket) => [bucket.key, bucket]));
-    const indexes = day.map((bucket) => SESSION_WINDOWS.findIndex((window) => window.key === bucket.key));
+    const indexes = day.map((bucket) => windows.findIndex((window) => window.key === bucket.key));
     const start = Math.min(...indexes);
     const end = Math.max(...indexes);
     for (let index = start; index <= end; index += 1) {
-      const window = SESSION_WINDOWS[index];
+      const window = windows[index];
       const bucket = byKey.get(window.key);
       const slot = bucket ? toSlot(bucket, window.label, window.weight) : emptySlot(day[0], window.label, window.weight);
       slots.push({ ...slot, showDate: index === start });
@@ -159,12 +162,14 @@ export function sessionTimeSlots(points: ChartPoint[]): TimeSlot[] {
   return slots;
 }
 
-export function sessionWindowLabel(iso: string): string {
+export function sessionWindowLabel(iso: string, interval: "30m" = "30m"): string {
   const ny = nyParts(iso);
   if (!ny) return iso;
-  const placed = classifyWindow(ny.minutes);
+  const placed = classifyWindow(ny.minutes, HALF_HOUR_WINDOWS);
+  void interval;
   const window = placed?.window;
-  const clock = window ? (window.weight < 1 ? `${window.label}–${pad(Math.floor(window.end / 60))}:${pad(window.end % 60)}` : window.label) : `${pad(ny.hour)}:${pad(ny.minute)}`;
+  const range = window ? `${window.label}–${pad(Math.floor(window.end / 60))}:${pad(window.end % 60)}` : "";
+  const clock = window ? range : `${pad(ny.hour)}:${pad(ny.minute)}`;
   return `${ny.dateLabel} ${clock} ET`;
 }
 
@@ -314,12 +319,12 @@ function emptySlot(sample: Bucket, axisLabel: string, weight: number): TimeSlot 
   };
 }
 
-function classifyWindow(minutes: number): { window: SessionWindow; distance: number } | null {
-  for (const window of SESSION_WINDOWS) {
+function classifyWindow(minutes: number, windows: SessionWindow[] = HALF_HOUR_WINDOWS): { window: SessionWindow; distance: number } | null {
+  for (const window of windows) {
     const scan = window.end + 15;
     if (minutes >= scan && minutes < scan + SCAN_GRACE_MINUTES) return { window, distance: 0 };
   }
-  for (const window of SESSION_WINDOWS) {
+  for (const window of windows) {
     const closes = window.end === 16 * 60;
     if (minutes < window.start) continue;
     if (closes ? minutes > window.end : minutes >= window.end) continue;

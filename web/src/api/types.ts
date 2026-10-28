@@ -1,6 +1,7 @@
 /** Shapes returned by src/ui/api/read_models.py. */
 
 export type SnapshotKind = "CURRENT" | "LOOKBACK" | null;
+export type BarInterval = "30m";
 export type ScanStatus = "PASS" | "BLOCKED";
 export type MovementLabel = "up" | "down" | "flat" | "new" | null;
 export type HistoryRange = "24H" | "3D" | "5D";
@@ -42,6 +43,7 @@ export interface LatestScan {
   executed_at: string | null;
   run_id: string | null;
   snapshot_kind: SnapshotKind;
+  bar_interval: BarInterval;
   evaluated: number;
   scored: number;
   passed: number;
@@ -54,6 +56,7 @@ export interface SymbolSearch {
   scan_timestamp: string;
   run_id: string | null;
   snapshot_kind: SnapshotKind;
+  bar_interval: BarInterval;
   total: number;
   limit: number;
   offset: number;
@@ -82,6 +85,7 @@ export interface HistoryPoint {
   scan_timestamp: string;
   run_id: string | null;
   snapshot_kind: SnapshotKind;
+  bar_interval: BarInterval;
   status: ScanStatus;
   reasons: string[];
   veto_reasons: string[];
@@ -108,6 +112,7 @@ export interface SymbolView {
   executed_at: string | null;
   run_id: string | null;
   snapshot_kind: SnapshotKind;
+  bar_interval: BarInterval;
   range: HistoryRange;
   since: string;
   detail: SymbolDetail;
