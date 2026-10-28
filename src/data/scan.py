@@ -4,7 +4,6 @@ from typing import List, Optional
 
 import pandas as pd
 import requests
-import yfinance as yf
 
 logger = logging.getLogger(__name__)
 
@@ -161,27 +160,6 @@ def fetch_sp500_symbols() -> List[str]:
         ) from exc
     logger.info("resolved full S&P 500 constituent list: %s symbols", len(symbols))
     return symbols
-
-
-def top_n_by_marketcap(symbols: List[str], n: int = 100) -> List[str]:
-    # Return top-n symbols by market cap using yfinance info (may be slow).
-    metas = []
-    for s in symbols:
-        try:
-            t = yf.Ticker(s)
-            info = t.info
-            mc = info.get("marketCap", 0) or 0
-            metas.append((s, mc))
-        except Exception:
-            metas.append((s, 0))
-    metas.sort(key=lambda x: x[1], reverse=True)
-    return [s for s, _ in metas[:n]]
-
-
-def build_universe_top_sp500(n: int = 100) -> List[str]:
-    symbols = fetch_sp500_symbols()
-    top = top_n_by_marketcap(symbols, n=n)
-    return top
 
 
 def build_sp500_universe(limit: Optional[int] = None) -> List[str]:

@@ -33,7 +33,6 @@ The evaluation pool is the S&P 500 constituent list in `src/data/scan.py`.
 - A table with fewer than 400 symbols is rejected.
 - Wikipedia share classes are normalized at that boundary: `BRK.B` becomes `BRK-B` and `BF.B` becomes `BF-B`. Those symbols stay in the universe.
 - `build_sp500_universe(limit)` returns that list. `limit` truncates it in constituent-list order. It does not sort by market cap.
-- `top_n_by_marketcap()` and `build_universe_top_sp500(n)` still exist. The Universe v1 scan and the hourly scheduler do not call them.
 
 `scripts/run_universe.py --symbols AAPL,MSFT` evaluates an explicit list through the same metric, veto, score, and snapshot path. With no `--symbols`, the scan scores the full S&P 500 pool. `--size` or `UNIVERSE_SIZE`, when set, caps that pool in constituent order. `scripts/scheduler.py` uses `UNIVERSE_SYMBOLS` when set, and otherwise the same pool. The scheduler runs at minute 0 and does not place orders.
 
@@ -46,11 +45,11 @@ Two timeframes feed the score. Both are OHLCV (`timestamp`, `open`, `high`, `low
 | Timeframe | Role |
 | --- | --- |
 | Daily | Long-term trend (`EMA200`) and liquidity (`ADV20`) |
-| Hourly | RSI(14), MACD histogram, ATR(14), ATR%, VolumeRatio, and the price shown in the ranking |
+| 30-minute | RSI(28), MACD(24, 52, 18), ATR(28), ATR%, VolumeRatio(40), and the price shown in the ranking |
 
 `src/data/provider.py` defines `MarketDataProvider.get_bars(symbol, start, end, interval)`. `prepare_ohlcv` is the only frame the metric, veto, scoring, and ranking code sees: lowercase columns, UTC index, floored to the minute, de-duplicated, rows with a missing close dropped. Naive timestamps are interpreted as UTC.
 
-`AlpacaMarketDataProvider` is the production default. `run_universe` constructs it when no provider is passed, and the scheduler uses that same path. It requests `https://data.alpaca.markets/v2/stocks/bars` with `feed=sip` and `adjustment=all`. A requested end inside the last 15 minutes is pulled back to that delay, because this SIP subscription rejects the whole query when the end reaches recent data. Intervals are `1d` → `1Day`, `1h` → `1Hour`, and `1m` → `1Min`. `BRK-B` and `BF-B` are sent as `BRK.B` and `BF.B`. The end bound is exclusive. Credentials are `ALPACA_API_KEY` and `ALPACA_API_SECRET`. `AlpacaIngest` remains the older broker wrapper and is not the universe default.
+`AlpacaMarketDataProvider` is the production default. `run_universe` constructs it when no provider is passed, and the scheduler uses that same path. It requests `https://data.alpaca.markets/v2/stocks/bars` with `feed=sip` and `adjustment=all`. A requested end inside the last 16 minutes is pulled back to that delay. This SIP subscription rejects the whole query when the end is 15 minutes ago or newer. Scan slots still wait 15 minutes after a window ends; the extra minute is only the query bound. Intervals are `1d` → `1Day`, `1h` → `1Hour`, `30m` → `30Min`, and `1m` → `1Min`. `BRK-B` and `BF-B` are sent as `BRK.B` and `BF.B`. The end bound is exclusive. Credentials are `ALPACA_API_KEY` and `ALPACA_API_SECRET`.
 
 `YFinanceMarketDataProvider` is no longer used by the production Universe path. It still delegates to `fetch_historical_yfinance` for tests and for `scripts/ab_alpaca_yahoo.py`.
 
@@ -58,9 +57,9 @@ Two timeframes feed the score. Both are OHLCV (`timestamp`, `open`, `high`, `low
 
 A missing `ALPACA_API_KEY` or `ALPACA_API_SECRET`, or an Alpaca `401`/`403`, raises `MarketDataUnavailable` on the first request. `BarStore` does not count that as a per-symbol `failed` sync, and `run_universe` writes no snapshot. One symbol whose fetch raises for another reason stays in the scan as insufficient data when another symbol still has bars. When every sync is `failed` across two or more symbols, the same exception stops the scan before `save_universe_snapshots`. The `failed` total is the existing `BarStore.actions` counter.
 
-Daily trend rule: a daily bar counts only when its America/New_York timestamp is strictly before the scan's New York session midnight. The in-progress session cannot enter `EMA200`. Hourly indicators use the last bar at or before the scan time, and only when that bar is at most two hours old (`HOURLY_STALE_AFTER`). Older hourly data is left blank. These are alignment rules so a scan does not read the future. They are not trading rules.
+Daily trend rule: a daily bar counts only when its America/New_York timestamp is strictly before the scan's New York session midnight. The in-progress session cannot enter `EMA200`. Intraday indicators use the last 30-minute bar at or before the scan time, and only when that bar is at most two hours old (`HOURLY_STALE_AFTER`). Older intraday data is left blank. These are alignment rules so a scan does not read the future. They are not trading rules.
 
-Default fetch windows are about 520 calendar days of daily bars (so `EMA200` has 200 completed sessions) and 60 calendar days of hourly bars. One run snapshots the last 24 shared hourly bars by default (`--lookback`).
+Default fetch windows are about 520 calendar days of daily bars (so `EMA200` has 200 completed sessions) and 60 calendar days of 30-minute bars. One run snapshots the last 48 shared 30-minute bars by default (`lookback_bars`).
 
 ### Bar cache
 
@@ -111,35 +110,35 @@ Implemented in `src/features/indicators.py` and assembled by `src/universe/metri
 
 `ema(close, 200)` is a recursive EMA with `adjust=False` (`alpha = 2 / 201`), seeded on the first close. The trend comparison is `latest completed daily close > latest daily EMA200`. Fewer than 200 completed daily bars leaves `daily_ema200` empty.
 
-### Hourly RSI(14)
+### 30-minute RSI(28)
 
-Cutler's RSI: SMA of gains and SMA of losses over 14 hourly changes. This is not Wilder's recursive RSI. A zero average loss uses a tiny epsilon so a run of gains approaches 100. The veto band is `35 <= RSI <= 75`.
+Cutler's RSI: SMA of gains and SMA of losses over 28 thirty-minute changes. This is not Wilder's recursive RSI. A zero average loss uses a tiny epsilon so a run of gains approaches 100. The veto band is `35 <= RSI <= 75`. The stored column is still named `rsi14`.
 
-### Hourly MACD histogram
+### 30-minute MACD histogram
 
-`macd_hist`: EMA(12) − EMA(26), minus the EMA(9) signal, all with `adjust=False`.
+`macd_hist`: EMA(24) − EMA(52), minus the EMA(18) signal, all with `adjust=False`. The helper defaults remain 12, 26, and 9 for callers other than Universe v1.
 
-### Hourly ATR(14) and ATR%
+### 30-minute ATR(28) and ATR%
 
-True range is the max of `high-low`, `|high − previous close|`, and `|low − previous close|`. The first bar uses `high − low`. Smoothing is Wilder's RMA via `ewm(alpha=1/14, adjust=False)`, seeded on the first true range.
+True range is the max of `high-low`, `|high − previous close|`, and `|low − previous close|`. The first bar uses `high − low`. Smoothing is Wilder's RMA via `ewm(alpha=1/28, adjust=False)`, seeded on the first true range.
 
-`atr_percent = ATR14 / current hourly close`.
+`atr_percent = ATR / current 30-minute close`. The stored column is still named `atr14`.
 
 ### VolumeRatio
 
-`current hourly volume / rolling_mean(hourly volume, 20)`. The window includes the current bar. A window whose mean volume is zero yields `0`. This is a participation ratio. The legacy `volume_spike` helper is unchanged and is not used by Universe v1.
+`current 30-minute volume / rolling_mean(volume, 40)`. The window includes the current bar. A window whose mean volume is zero yields `0`. This is a participation ratio. The legacy `volume_spike` helper is unchanged and is not used by Universe v1.
 
 ### ADV20
 
-`rolling_mean(close * volume, 20)` on the daily series. The $5,000,000 threshold is a daily liquidity floor, so ADV20 stays on daily bars while VolumeRatio stays on hourly bars. Fewer than 20 completed daily bars leaves `adv20` empty.
+`rolling_mean(close * volume, 20)` on the daily series. The $5,000,000 threshold is a daily liquidity floor, so ADV20 stays on daily bars while VolumeRatio stays on 30-minute bars. Fewer than 20 completed daily bars leaves `adv20` empty.
 
 ## Hard veto
 
 `src/universe/veto.py`. Every rule is evaluated on its own. `veto_reasons` lists every failure. `veto_status` is the earliest failure in this order:
 
 1. `BLOCKED_TREND` — completed `daily_close <= daily_EMA200`
-2. `BLOCKED_RSI` — hourly RSI `< 35` or `> 75`
-3. `BLOCKED_VOLATILITY` — `ATR14 / hourly_close > 0.04` (`0.04` passes)
+2. `BLOCKED_RSI` — 30-minute RSI `< 35` or `> 75`
+3. `BLOCKED_VOLATILITY` — `ATR / hourly_close > 0.04` (`0.04` passes)
 4. `BLOCKED_VOLUME` — `VolumeRatio < 0.8` (`0.8` passes)
 5. `BLOCKED_LIQUIDITY` — daily `ADV20 < 5,000,000` (`5,000,000` passes)
 6. `BLOCKED_EARNINGS` — earnings inside the next 48 hours, only when a reliable calendar says so
@@ -153,8 +152,6 @@ True range is the max of `high-low`, `|high − previous close|`, and `|low − 
 
 An available provider that returns `True` sets `earnings_check` to `within_48h` and adds `BLOCKED_EARNINGS`. A return of `False` sets `earnings_check` to `clear`. A missing date from an otherwise available provider stays `None` and does not block that symbol. No zero-filled earnings series is treated as a calendar.
 
-The legacy feature bundle in `compute_all_features` stores NaN for `earnings_proximity`, `news_sentiment`, and `short_interest`. Universe v1 does not read those series.
-
 ## Scoring
 
 `src/universe/scoring.py` maps each factor onto `[0, 10]` and combines them with weights from `config/universe_weights.yaml`. PASS and BLOCKED rows use the same formulas when the required inputs are finite:
@@ -162,8 +159,8 @@ The legacy feature bundle in `compute_all_features` stores NaN for `earnings_pro
 | Factor | Weight | Inputs |
 | --- | --- | --- |
 | Trend | 30% | Distance of daily close above EMA200 |
-| Momentum | 30% | Hourly RSI and MACD histogram |
-| Volatility risk | 20% | Hourly ATR% |
+| Momentum | 30% | 30-minute RSI and MACD histogram |
+| Volatility risk | 20% | 30-minute ATR% |
 | Volume / liquidity | 20% | VolumeRatio and daily ADV20 |
 
 Weights must sum to 1, so the final score stays on `[0, 10]`.
@@ -180,8 +177,6 @@ Normalization (scale anchors, not extra vetoes):
 - Volume/liquidity is the equal blend of those two components.
 
 `apply_score` computes those fields whenever `daily_close`, `daily_ema200`, `hourly_close`, `rsi14`, `macd_hist`, `atr_percent`, `volume_ratio`, and `adv20` are finite and usable (denominators are not zero, and ATR%, VolumeRatio, and ADV20 are not negative). Missing or invalid inputs clear the five score fields. No substitute score is invented.
-
-`src/scoring/engine.py` is the older raw weighted sum of feature values (`config/weights.yaml`). `TradingBotManager` still calls it. The universe pipeline does not.
 
 ## Ranking
 
@@ -224,21 +219,21 @@ The result is raw data. It is stored in `minute_enrichment` inside the universe 
 
 ## Snapshot schema
 
-SQLite database, default `artifacts/universe.db` (`UNIVERSE_DB` overrides it), table `universe_snapshots`. Each scan inserts rows. `UNIQUE(scan_timestamp, symbol)` plus `INSERT OR IGNORE` leaves an existing snapshot unchanged. History is the point of the table: a later decision is a new row. The latest `scan_timestamp` is the scan clock, UTC, floored to the minute. Earlier rows from the same run keep their hourly bar timestamps. `executed_at` is the wall clock of the write and is never copied from `scan_timestamp`. An older database gains `executed_at` on open.
+SQLite database, default `artifacts/universe.db` (`UNIVERSE_DB` overrides it), table `universe_snapshots`. Each scan inserts rows. `UNIQUE(scan_timestamp, symbol)` plus `INSERT OR IGNORE` leaves an existing snapshot unchanged. History is the point of the table: a later decision is a new row. The latest `scan_timestamp` is the scan clock, UTC, floored to the minute. Earlier rows from the same run keep their 30-minute bar timestamps. `executed_at` is the wall clock of the write and is never copied from `scan_timestamp`. An older database gains `executed_at` on open.
 
 | Column | Meaning |
 | --- | --- |
-| `scan_timestamp` | Decision time, UTC ISO-8601. The latest row is the scan clock. Earlier lookback rows are hourly bar timestamps |
+| `scan_timestamp` | Decision time, UTC ISO-8601. The latest row is the scan clock. Earlier lookback rows are 30-minute bar timestamps |
 | `symbol` | Ticker |
-| `hourly_close` | Hourly close used as price |
+| `hourly_close` | 30-minute close used as price. The column name is unchanged |
 | `daily_close` | Last completed daily close |
 | `daily_ema200` | EMA(200) of that daily history |
-| `rsi14` | Hourly RSI(14) |
-| `macd_hist` | Hourly MACD histogram |
-| `atr14` | Hourly ATR(14) |
-| `atr_percent` | ATR14 / hourly close |
-| `volume` | Current hourly volume |
-| `volume_ratio` | Hourly VolumeRatio |
+| `rsi14` | 30-minute RSI(28). The column name is unchanged |
+| `macd_hist` | 30-minute MACD histogram, parameters 24, 52, 18 |
+| `atr14` | 30-minute ATR(28). The column name is unchanged |
+| `atr_percent` | ATR / 30-minute close |
+| `volume` | Current 30-minute volume |
+| `volume_ratio` | 30-minute VolumeRatio(40) |
 | `adv20` | 20-day average dollar volume |
 | `veto_status` | `PASS` or the primary block |
 | `veto_reasons` | JSON list of every failed rule |
@@ -257,19 +252,15 @@ The latest scan is also exported as `artifacts/universe_<timestamp>.csv` and `ar
 
 ## UI
 
-`streamlit run src/ui/streamlit_app.py`
+The React app in `web/` reads the snapshot database through the FastAPI routes in `src/ui/api/routes.py`. The desktop **WEB UI** button opens `http://127.0.0.1:5173` and starts Vite plus `uvicorn` on port 8000 when they are down.
 
-The page reads the snapshot database. The main table is the latest scan's top 100 by score. Display times use `Europe/Athens`.
-
-`Rank`, `Movement`, `Symbol`, `Price`, `Status`, `Score`, `RSI`, `MACD Histogram`, `ATR%`, `Volume Ratio`, `ADV`
-
-`ATR%` is `atr_percent * 100` (percent points). Status is `PASS` or `BLOCKED`. Raw veto codes stay in the database and are not shown in the Status column. BLOCKED symbols with a score appear in the top 100 when their rank is 100 or better. Symbols without a score are omitted from the table.
+The dashboard is the latest scan's top 100 by score. Display times use `Europe/Athens`. Status is `PASS` or `BLOCKED`. Raw veto codes stay in the database. BLOCKED symbols with a score appear in the top 100 when their rank is 100 or better. Symbols without a score are omitted.
 
 Movement compares the current rank with the symbol's previous stored rank (`previous_rank - current_rank`). An improvement is `🟢 ↑N`, a drop is `🔴 ↓N`, an unchanged rank is `—`, and no earlier rank is `NEW`.
 
-A symbol selector under the table loads history for that symbol only. The range is `24H` (default), `3D`, or `5D`, measured back from the clock hour that contains the latest snapshot. The history table shows time, `PASS` or `BLOCKED`, and a readable reason (`—` for PASS; veto codes joined with `; ` for BLOCKED). Charts for RSI, Score, ATR%, and Volume Ratio use those stored rows. Coverage compares stored rows with that hourly grid. A latest snapshot at `17:02` fills the `17:00` hour, so it is not reported as a missing `:00` row, and the earlier hourly snapshots stay on their own timestamps. When the latest scan's earnings checks are all `unavailable`, the page says the earnings veto is pending.
+A symbol page loads history for that symbol only. The range is `24H` (default), `3D`, or `5D`, measured back from the clock hour that contains the latest snapshot. Charts for RSI, Score, ATR%, and Volume Ratio use those stored rows. `ATR%` is `atr_percent * 100` (percent points). Coverage compares stored rows with the 30-minute session grid. A latest snapshot at `17:02` fills the `17:00` window. When the latest scan's earnings checks are all `unavailable`, the page says the earnings veto is pending.
 
-The FastAPI app in `src/ui/app.py` remains a JSON view of the scores CSV.
+`GET /scores` on `src/ui/app.py` remains a JSON view of the latest `scores_*.csv`.
 
 ## How to run
 
@@ -278,7 +269,8 @@ From the repository root, with the project virtualenv:
 ```text
 .venv\Scripts\python -m pytest -q
 .venv\Scripts\python scripts\run_universe.py --symbols AAPL,MSFT,NVDA,AMZN,META,JPM,XOM,JNJ
-.venv\Scripts\streamlit run src/ui/streamlit_app.py
+.venv\Scripts\python -m uvicorn src.ui.app:app --host 127.0.0.1 --port 8000
+npm run dev --prefix web
 ```
 
 With no `--symbols`, the scan evaluates the full S&P 500 constituent list. `--size N` or `UNIVERSE_SIZE` caps that list in constituent order and does not sort by market cap. `UNIVERSE_DB` overrides the snapshot database. `MARKET_BARS_DB` overrides the OHLCV cache. `UNIVERSE_SYMBOLS` overrides the scheduler's symbol list.
@@ -288,13 +280,13 @@ With no `--symbols`, the scan evaluates the full S&P 500 constituent list. `--si
 - Earnings dates are not available from the current provider. The veto interface exists and the check is reported as `unavailable`.
 - RSI is Cutler's SMA form, matching the existing helper, not Wilder's RSI.
 - ATR uses Wilder's recursive average seeded on the first true range, not an SMA-seeded ATR.
-- ADV20 is daily dollar volume. VolumeRatio is hourly.
+- ADV20 is daily dollar volume. VolumeRatio uses 40 completed 30-minute bars.
 - Score caps (10% above EMA200, ±2% MACD, VolumeRatio 2.0, 20× ADV) only keep the weighted score on a common 0–10 scale. They are not optimized entry rules.
 - Production bars come from Alpaca SIP with `adjustment=all`. `YFinanceMarketDataProvider` remains for tests and the offline Yahoo comparison. The universe does not add a second adjustment on top of the provider response.
 - An existing `artifacts/market_bars.db` filled by an earlier Yahoo scan is not deleted by the provider switch. BarStore still skips a window it already considers fresh, and a material price change rebuilds only through the existing revision path.
 - `observed_minutes` cannot be recovered from an hourly bar. Early pre-market and late after-hours hours often contain fewer than 60 trade minutes. That is recorded as coverage, not treated as a data failure.
 - `REGULAR` hourly bars do not contain the 09:30 open or the 16:00 closing print. Those prints sit in the two `MIXED` hours.
-- One pipeline run backfills the last 24 hourly bars already on disk. After that, new hours append when the scan runs again. The UI ranges `24H`, `3D`, and `5D` read those stored snapshots. A cash session is shorter than a calendar day, and a weekend has no new bars, so a range can contain fewer points than its label suggests.
+- One pipeline run snapshots the last 48 shared 30-minute bars by default. The UI ranges `24H`, `3D`, and `5D` read those stored snapshots. A cash session is shorter than a calendar day, and a weekend has no new bars, so a range can contain fewer points than its label suggests.
 - Rank movement uses the latest earlier snapshot that has a rank for that symbol. The first ranked snapshot for a symbol is `NEW`.
 - The evaluation pool is the Wikipedia S&P 500 list, not a market-cap top 100. Top 100 is the score ranking shown in the UI.
 - Half-days with an early official close are not a separate session type. The clock labels still apply.
@@ -304,9 +296,7 @@ With no `--symbols`, the scan evaluates the full S&P 500 constituent list. `--si
 
 These files are still in the repo. Universe v1 does not call them to trade.
 
-- `src/scoring/engine.py` — legacy raw weighted sum (`config/weights.yaml`).
-- `src/bot/manager.py` — single-position paper bot (limit entry, 2% stop, 4% target, 24-hour hold).
-- `src/execution/alpaca_adapter.py`, `src/risk/manager.py` — paper orders and position/loss limits.
+- `src/execution/alpaca_adapter.py`, `src/risk/manager.py` — paper orders and position/loss limits. The watch engine uses them. Buys stay disabled because no Universe entry rule is defined.
 - `src/backtest/engine.py`, `src/backtest/execution.py` — single-name and portfolio backtests with a local fill simulator.
 - `src/strategy/simple_mean_reversion.py` — sample strategy used by the backtest scripts.
 - `src/ui/app.py` — FastAPI `/scores`.
@@ -320,5 +310,3 @@ These files are still in the repo. Universe v1 does not call them to trade.
 - Order execution guard, position guardian, dynamic take-profit and stop-loss
 - Multi-position portfolio selection, adaptive thresholds, market-regime detection
 - Live trading
-
-The legacy raw scorer is not the Universe v1 score.
