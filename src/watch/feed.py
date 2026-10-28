@@ -12,6 +12,7 @@ unsubscribed; they are not dropped without a record.
 from __future__ import annotations
 
 from dataclasses import dataclass
+import threading
 
 import pandas as pd
 
@@ -22,6 +23,7 @@ BASIC_IEX_STREAM_SYMBOL_LIMIT = 30
 # connection message refreshes liveness. One quiet name does not.
 STALE_AFTER = pd.Timedelta(seconds=90)
 _LIVENESS_TYPES = frozenset({"success", "subscription", "error", "t", "q", "b", "d"})
+_AUTH_FAILURE_CODES = frozenset({401, 402, 403, 404})
 
 
 @dataclass(frozen=True)
@@ -62,67 +64,112 @@ class IexFeed:
         self.last_message_at = None
         self.last_trade_at: dict[str, pd.Timestamp] = {}
         self.last_trade_price: dict[str, float] = {}
+        self.resubscribe = False
+        self.auth_failed = False
+        self._lock = threading.RLock()
 
     def set_required(self, positions: list[str], candidates: list[str]) -> SubscriptionPlan:
-        plan = plan_subscription(positions, candidates, self.symbol_limit)
-        self.required = plan.subscribed
-        self.omitted = plan.omitted
-        self.coverage_complete = plan.complete
-        if self.connected:
-            self.health_confirmed = self.authenticated and self._subscription_matches()
-        return plan
+        with self._lock:
+            plan = plan_subscription(positions, candidates, self.symbol_limit)
+            self.required = plan.subscribed
+            self.omitted = plan.omitted
+            self.coverage_complete = plan.complete
+            self.resubscribe = True
+            if self.connected:
+                self.health_confirmed = self.authenticated and self._subscription_matches()
+            return plan
 
     def connect(self) -> None:
         """Mark the socket open. Health stays unconfirmed until IEX authenticates and subscribes."""
-        self.connected = True
-        self.authenticated = False
-        self.health_confirmed = False
-        self.subscribed = frozenset()
+        with self._lock:
+            self.connected = True
+            self.authenticated = False
+            self.health_confirmed = False
+            self.auth_failed = False
+            self.subscribed = frozenset()
 
     def disconnect(self) -> None:
-        self.connected = False
-        self.health_confirmed = False
+        """Drop health and cached prints. A dead socket must not keep a price."""
+        with self._lock:
+            self.connected = False
+            self.health_confirmed = False
+            self.subscribed = frozenset()
+            self.last_trade_price.clear()
+            self.last_trade_at.clear()
+
+    def authenticated_ok(self) -> bool:
+        with self._lock:
+            return self.authenticated and not self.auth_failed
+
+    def take_resubscribe(self) -> tuple[str, ...] | None:
+        """Symbols to send, once. ``None`` when the socket is already current."""
+        with self._lock:
+            if not self.resubscribe:
+                return None
+            self.resubscribe = False
+            return tuple(self.required)
 
     def ingest(self, payload, now) -> None:
         """Apply one IEX message or a list of messages. Does not open a socket."""
         moment = _aware(now)
         messages = payload if isinstance(payload, list) else [payload]
-        for message in messages:
-            kind = str(message.get("T", ""))
-            if kind not in _LIVENESS_TYPES:
-                continue
-            self.last_message_at = moment
-            if kind == "success" and message.get("msg") == "authenticated":
-                self.authenticated = True
-            elif kind == "subscription":
-                self.subscribed = frozenset(message.get("trades") or [])
-                self.health_confirmed = self.connected and self.authenticated and self._subscription_matches()
-            elif kind == "t":
-                symbol = str(message.get("S", ""))
-                if symbol:
-                    self.last_trade_at[symbol] = moment
-                    price = message.get("p")
-                    if price is not None:
-                        self.last_trade_price[symbol] = float(price)
+        with self._lock:
+            for message in messages:
+                if not isinstance(message, dict):
+                    continue
+                kind = str(message.get("T", ""))
+                if kind not in _LIVENESS_TYPES:
+                    continue
+                self.last_message_at = moment
+                if kind == "success" and message.get("msg") == "authenticated":
+                    self.authenticated = True
+                    self.auth_failed = False
+                elif kind == "error" and _auth_error(message):
+                    self.authenticated = False
+                    self.auth_failed = True
+                    self.health_confirmed = False
+                elif kind == "subscription":
+                    self.subscribed = frozenset(message.get("trades") or [])
+                    self.health_confirmed = self.connected and self.authenticated and self._subscription_matches()
+                elif kind == "t":
+                    symbol = str(message.get("S", ""))
+                    if symbol:
+                        self.last_trade_at[symbol] = moment
+                        price = message.get("p")
+                        if price is not None:
+                            self.last_trade_price[symbol] = float(price)
 
     def healthy(self, now) -> bool:
         """True only after a confirmed IEX subscription that is still fresh."""
-        if not self.connected or not self.authenticated or not self.health_confirmed:
-            return False
-        if not self.coverage_complete:
-            return False
-        if self.last_message_at is None:
-            return False
-        moment = _aware(now)
-        if moment - self.last_message_at > self.stale_after:
-            return False
-        return self._subscription_matches()
+        with self._lock:
+            if not self.connected or not self.authenticated or not self.health_confirmed:
+                return False
+            if self.auth_failed or not self.coverage_complete:
+                return False
+            if self.last_message_at is None:
+                return False
+            moment = _aware(now)
+            if moment - self.last_message_at > self.stale_after:
+                return False
+            return self._subscription_matches()
 
     def price(self, symbol: str):
-        return self.last_trade_price.get(symbol)
+        with self._lock:
+            return self.last_trade_price.get(symbol)
 
     def _subscription_matches(self) -> bool:
         return set(self.required).issubset(self.subscribed)
+
+
+def _auth_error(message: dict) -> bool:
+    code = message.get("code")
+    try:
+        if int(code) in _AUTH_FAILURE_CODES:
+            return True
+    except (TypeError, ValueError):
+        pass
+    text = str(message.get("msg", "")).lower()
+    return "auth" in text
 
 
 def _aware(value) -> pd.Timestamp:

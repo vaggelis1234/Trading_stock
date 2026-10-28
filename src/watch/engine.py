@@ -4,12 +4,9 @@ The engine starts after the first successful regular Universe scan and keeps
 evaluating until the cash session closes. It does not stop between hourly
 scans. The 16:15 final scan does not start it and does not open a buy cycle.
 
-Universe v1 has no entry trigger. ``TradingBotManager.choose_and_enter`` buys
-the top legacy score; that is not an Universe entry rule, so buys stay
-disabled. The prototype bot also exits on a 2% stop, a 4% target, and a
-24-hour hold. The 24-hour hold is an outside-session policy. No Universe
-session exit rule is defined, so this monitor records order state and does
-not submit exits.
+Universe v1 has no entry trigger, so buys stay disabled. No session exit
+rule is defined, so this monitor records order state and does not submit
+exits.
 """
 
 from __future__ import annotations
@@ -50,17 +47,23 @@ class PositionMonitor:
         self.orders = orders
         self.adapter = adapter
         self.polls: list[str] = []
+        self.poll_failures: list[str] = []
         self.exit_submissions = 0
         logger.warning("%s", EXIT_RULE_GAP)
 
     def tick(self, now) -> None:
-        """Refresh status during the session. Never submits an order."""
+        """Refresh working orders. A broker error leaves the stored status unchanged."""
         del now
         for order in self.orders.open_orders():
             broker_id = order.get("broker_id") or ""
             if not broker_id:
                 continue
-            remote = self.adapter.get_order(broker_id)
+            try:
+                remote = self.adapter.get_order(broker_id)
+            except Exception:
+                logger.exception("order poll failed for %s; status left unchanged", broker_id)
+                self.poll_failures.append(broker_id)
+                continue
             self.orders.apply_remote(order["id"], remote)
             self.polls.append(broker_id)
 
@@ -76,9 +79,19 @@ class BuyGate:
         self.last_block: list[str] = []
         self.submitted: list[str] = []
 
-    def block_reasons(self, now, *, feed: IexFeed, snapshot_safe: bool, session_close: time) -> list[str]:
+    def block_reasons(
+        self,
+        now,
+        *,
+        feed: IexFeed,
+        snapshot_safe: bool,
+        session_close: time,
+        buys_closed: bool = False,
+    ) -> list[str]:
         moment = as_new_york(now)
         reasons = []
+        if buys_closed:
+            reasons.append("final_slot")
         if moment.time() >= ABSOLUTE_BUY_CUTOFF:
             reasons.append("after_1600_et")
         if session_close is not None and moment.time() >= session_close:
@@ -103,6 +116,9 @@ class BuyGate:
             return None
         if not _paper_endpoint(self.adapter):
             self.last_block = ["live_trading_disabled"]
+            return None
+        if _trading_client_missing(self.adapter):
+            self.last_block = ["broker_unavailable"]
             return None
         symbol = str(row["symbol"])
         session_date = moment.date()
@@ -162,6 +178,7 @@ class WatchEngine:
     def on_scan_success(self, slot, rows: list[dict]) -> None:
         if slot.kind == FINAL:
             self.final_scan_seen = True
+            self.evaluating = False
             logger.info("final universe scan %s updated history and did not open a buy cycle", slot.slot_id)
             return
         self._refresh(rows, slot.session_date)
@@ -180,15 +197,21 @@ class WatchEngine:
         self._refresh(rows, _session_day(rows))
 
     def tick(self, now, session_close: time) -> None:
+        """Advance one clock minute.
+
+        Buy checks run only while this session still has candidates. Working
+        orders are polled only while one is open. A minute with neither does
+        not record an evaluation. The session clock itself keeps ticking so a
+        later Universe slot is not missed.
+        """
         self.session_close = session_close
         moment = as_new_york(now)
-        if _session_ended(moment, session_close):
+        if _session_ended(moment, session_close) or self.final_scan_seen:
             self.evaluating = False
+        if self.orders.open_orders():
             self.positions.tick(moment)
-            return
-        if self.started and self.evaluating:
+        if self.started and self.evaluating and self.candidates:
             self.evaluate_minute(moment)
-        self.positions.tick(moment)
 
     def evaluate_minute(self, now):
         moment = as_new_york(now).floor("min")
@@ -198,7 +221,7 @@ class WatchEngine:
         if self._paused:
             self._queue.append(moment)
             return None
-        if not self.started or not self.evaluating:
+        if not self.started or not self.evaluating or not self.candidates:
             return None
         key = moment.isoformat()
         if key in self._evaluated:
@@ -210,6 +233,7 @@ class WatchEngine:
             feed=self.feed,
             snapshot_safe=self.snapshot_safe_for_buys,
             session_close=self.session_close,
+            buys_closed=self.final_scan_seen,
         )
         if reasons or self.order_sizer is None:
             self.buy_gate.last_block = reasons
@@ -280,6 +304,15 @@ def _session_ended(moment: pd.Timestamp, session_close: time) -> bool:
 def _paper_endpoint(adapter) -> bool:
     url = str(getattr(adapter, "base_url", "") or "")
     return url.startswith(PAPER_URL)
+
+
+def _trading_client_missing(adapter) -> bool:
+    """True when this adapter declares a broker client and does not have one.
+
+    Test doubles omit ``client``. The Alpaca adapter sets it to ``None`` when
+    the trading SDK is absent, and that path must not invent an order.
+    """
+    return hasattr(adapter, "client") and getattr(adapter, "client") is None
 
 
 def _session_day(rows: list[dict]):

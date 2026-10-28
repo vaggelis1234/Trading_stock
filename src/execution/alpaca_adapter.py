@@ -34,7 +34,7 @@ class AlpacaAdapter:
 
     def get_order(self, order_id: str) -> Dict[str, Any]:
         if not self.client:
-            return {"id": order_id, "status": "filled"}
+            raise RuntimeError("Alpaca trading client is unavailable; order status was not invented")
         order = self.client.get_order(order_id)
         return order._raw
 

@@ -368,6 +368,100 @@ def test_default_entry_rule_stays_disabled():
     assert ENTRY_RULE_DEFINED is False
 
 
+def test_idle_minutes_skip_evaluation_and_a_poll_error_keeps_status(tmp_path):
+    engine, adapter = _engine(tmp_path)
+    engine.on_scan_success(_slots()[0], [_row("AAPL", 1)])
+    engine.tick(_et(11, 0), time(16, 0))
+    assert [stamp.strftime("%H:%M") for stamp in engine.evaluations] == ["11:00"]
+    engine.candidates.clear()
+    engine.tick(_et(11, 1), time(16, 0))
+    assert [stamp.strftime("%H:%M") for stamp in engine.evaluations] == ["11:00"]
+    assert engine.positions.polls == []
+
+    assert engine.orders.reserve("AAPL", DAY, 1, 10)
+    engine.orders.mark("AAPL", DAY, "submitted", "paper-1", 0)
+    adapter.remote["paper-1"] = {"id": "paper-1", "status": "accepted", "filled_qty": 0}
+    engine.tick(_et(11, 2), time(16, 0))
+    assert engine.positions.polls == ["paper-1"]
+    assert [stamp.strftime("%H:%M") for stamp in engine.evaluations] == ["11:00"]
+
+    def explode(order_id):
+        del order_id
+        raise RuntimeError("broker timeout")
+
+    adapter.get_order = explode
+    engine.tick(_et(11, 3), time(16, 0))
+    assert engine.orders.latest("AAPL")["status"] == "working"
+    assert engine.positions.poll_failures == ["paper-1"]
+    assert adapter.submits == []
+
+
+def test_early_close_blocks_buys_at_the_real_close_and_the_final_slot_stops_checks(tmp_path):
+    engine, adapter = _engine(tmp_path)
+    early = date(2025, 11, 28)
+    engine.on_scan_success(_slots()[0], [_row("AAPL", 1)])
+    engine.buy_gate.entry_rule_defined = True
+    engine.order_sizer = lambda row, price: 1
+    allowed_at = _et(12, 59, early)
+    _arm(engine.feed, ["AAPL"], allowed_at)
+    opened = engine.buy_gate.submit_buy(
+        _row("MSFT", 1),
+        allowed_at,
+        qty=1,
+        price=10,
+        feed=engine.feed,
+        snapshot_safe=True,
+        session_close=time(13, 0),
+    )
+    assert opened is not None
+    blocked = engine.buy_gate.submit_buy(
+        _row("NVDA", 1),
+        _et(13, 0, early),
+        qty=1,
+        price=10,
+        feed=engine.feed,
+        snapshot_safe=True,
+        session_close=time(13, 0),
+    )
+    assert blocked is None
+    assert "session_closed" in engine.buy_gate.last_block
+    assert "after_1600_et" not in engine.buy_gate.last_block
+    assert [item["symbol"] for item in adapter.submits] == ["MSFT"]
+
+    final = _slots()[-1]
+    engine.on_scan_success(final, [_row("LATE", 1)])
+    assert engine.evaluating is False
+    assert [row["symbol"] for row in engine.candidates] == ["AAPL"]
+    before = len(engine.evaluations)
+    engine.tick(_et(16, 15), time(16, 0))
+    assert len(engine.evaluations) == before
+    assert len(adapter.submits) == 1
+
+
+def test_missing_trading_client_does_not_invent_orders_or_fills(tmp_path):
+    from src.execution.alpaca_adapter import AlpacaAdapter
+    from src.watch.engine import PositionMonitor
+
+    adapter = AlpacaAdapter(api_key="local", api_secret="local", base_url="https://paper-api.alpaca.markets")
+    adapter.client = None
+    now = _et(11, 0)
+    feed = _healthy(["AAPL"], now)
+    gate = _open_gate(str(tmp_path / "orders.db"), adapter, RiskManager(cash=100000, max_position_percent=1.0))
+    assert gate.submit_buy(_row("AAPL", 1), now, 1, 10, feed=feed, snapshot_safe=True, session_close=time(16, 0)) is None
+    assert gate.last_block == ["broker_unavailable"]
+    assert gate.orders.latest("AAPL") is None
+
+    orders = OrderStore(str(tmp_path / "working.db"))
+    assert orders.reserve("AAPL", DAY, 1, 10)
+    orders.mark("AAPL", DAY, "partial", "broker-7", 1)
+    monitor = PositionMonitor(orders, adapter)
+    monitor.tick(now)
+    assert orders.latest("AAPL")["status"] == "partial"
+    assert orders.latest("AAPL")["filled_qty"] == 1
+    assert monitor.poll_failures == ["broker-7"]
+    assert monitor.exit_submissions == 0
+
+
 def test_uncertain_submit_is_not_retried(tmp_path, caplog):
     del caplog
     adapter = PaperAdapter()
