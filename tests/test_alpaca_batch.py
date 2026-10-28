@@ -466,5 +466,5 @@ def test_run_universe_uses_one_batch_per_timeframe(tmp_path):
         now=pd.Timestamp("2026-09-16T18:00:00Z"),
     )
     assert [call["symbols"] for call in calls if call["interval"] == "1d"] == [("AAPL", "MSFT")]
-    assert [call["symbols"] for call in calls if call["interval"] == "1h"] == [("AAPL", "MSFT")]
+    assert [call["symbols"] for call in calls if call["interval"] == "30m"] == [("AAPL", "MSFT")]
     assert {row["symbol"] for row in rows} == {"AAPL", "MSFT"}

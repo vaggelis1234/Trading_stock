@@ -14,7 +14,7 @@ from src.market.calendar import EARLY_CLOSE, NyseCalendar
 from src.persistence.store import save_universe_snapshots
 from src.universe.schedule import as_new_york, session_slots
 from src.universe.schedule_store import ScheduleStore
-from src.universe.session_runner import SessionRunner
+from src.universe.session_runner import SessionRunner, manual_scan_action
 from src.watch.engine import WatchEngine
 from src.watch.orders import OrderStore
 
@@ -72,18 +72,24 @@ def _runner(tmp_path, scan):
 def test_regular_session_slots_do_not_overlap_and_the_final_window_is_thirty_minutes():
     slots = session_slots(NyseCalendar().session(DAY))
     assert _labels(slots) == [
-        ("10:45", "09:30", "10:30", "regular", 60),
-        ("11:45", "10:30", "11:30", "regular", 60),
-        ("12:45", "11:30", "12:30", "regular", 60),
-        ("13:45", "12:30", "13:30", "regular", 60),
-        ("14:45", "13:30", "14:30", "regular", 60),
-        ("15:45", "14:30", "15:30", "regular", 60),
+        ("10:15", "09:30", "10:00", "regular", 30),
+        ("10:45", "10:00", "10:30", "regular", 30),
+        ("11:15", "10:30", "11:00", "regular", 30),
+        ("11:45", "11:00", "11:30", "regular", 30),
+        ("12:15", "11:30", "12:00", "regular", 30),
+        ("12:45", "12:00", "12:30", "regular", 30),
+        ("13:15", "12:30", "13:00", "regular", 30),
+        ("13:45", "13:00", "13:30", "regular", 30),
+        ("14:15", "13:30", "14:00", "regular", 30),
+        ("14:45", "14:00", "14:30", "regular", 30),
+        ("15:15", "14:30", "15:00", "regular", 30),
+        ("15:45", "15:00", "15:30", "regular", 30),
         ("16:15", "15:30", "16:00", "final", 30),
     ]
     for earlier, later in zip(slots, slots[1:]):
         assert earlier.window_end == later.window_start
         assert earlier.window_end <= later.window_start
-    assert [half.strftime("%H:%M") for half in slots[-2].halves] == ["14:30", "15:00"]
+    assert [half.strftime("%H:%M") for half in slots[-2].halves] == ["15:00"]
     assert [half.strftime("%H:%M") for half in slots[-1].halves] == ["15:30"]
     assert all(slot.window_start.strftime("%H:%M") != "15:00" or slot.window_minutes != 60 for slot in slots)
     assert slots[-1].opens_buys is False
@@ -97,9 +103,12 @@ def test_early_close_keeps_only_completed_windows_and_the_real_last_half_hour():
     assert session.close_et == EARLY_CLOSE
     slots = session_slots(session)
     assert _labels(slots) == [
-        ("10:45", "09:30", "10:30", "regular", 60),
-        ("11:45", "10:30", "11:30", "regular", 60),
-        ("12:45", "11:30", "12:30", "regular", 60),
+        ("10:15", "09:30", "10:00", "regular", 30),
+        ("10:45", "10:00", "10:30", "regular", 30),
+        ("11:15", "10:30", "11:00", "regular", 30),
+        ("11:45", "11:00", "11:30", "regular", 30),
+        ("12:15", "11:30", "12:00", "regular", 30),
+        ("12:45", "12:00", "12:30", "regular", 30),
         ("13:15", "12:30", "13:00", "final", 30),
     ]
     assert all(slot.window_end <= _et(EARLY, 13, 0) for slot in slots)
@@ -127,11 +136,11 @@ def test_dst_changes_the_utc_instant_and_not_the_new_york_clock():
     march = session_slots(calendar.session(date(2026, 3, 9)))[0]
     november = session_slots(calendar.session(date(2026, 11, 2)))[0]
     before = session_slots(calendar.session(date(2026, 3, 6)))[0]
-    assert march.scan_at.strftime("%H:%M") == "10:45"
-    assert november.scan_at.strftime("%H:%M") == "10:45"
-    assert march.scan_at.tz_convert("UTC").strftime("%H:%M") == "14:45"
-    assert november.scan_at.tz_convert("UTC").strftime("%H:%M") == "15:45"
-    assert before.scan_at.tz_convert("UTC").strftime("%H:%M") == "15:45"
+    assert march.scan_at.strftime("%H:%M") == "10:15"
+    assert november.scan_at.strftime("%H:%M") == "10:15"
+    assert march.scan_at.tz_convert("UTC").strftime("%H:%M") == "14:15"
+    assert november.scan_at.tz_convert("UTC").strftime("%H:%M") == "15:15"
+    assert before.scan_at.tz_convert("UTC").strftime("%H:%M") == "15:15"
 
 
 def test_naive_clock_is_rejected():
@@ -264,6 +273,93 @@ def test_watch_resumes_from_the_saved_snapshot_without_a_new_scan(tmp_path):
     assert calls == []
     assert watch.started is True
     assert [row["symbol"] for row in watch.candidates] == ["AAPL"]
+
+
+def test_manual_snapshot_resumes_without_claiming_a_second_scan(tmp_path):
+    calls = []
+
+    def scan(slot, now):
+        del now
+        calls.append(slot.slot_id)
+        return _Result(True, [])
+
+    db = str(tmp_path / "universe.db")
+    save_universe_snapshots(
+        [
+            {
+                "scan_timestamp": "2026-10-19T14:45:00+00:00",
+                "symbol": "AAPL",
+                "veto_status": "PASS",
+                "veto_reasons": [],
+                "earnings_check": "unavailable",
+                "rank": 1,
+                "final_score": 8,
+            }
+        ],
+        db,
+        snapshot_kind="CURRENT",
+    )
+    runner, watch = _runner(tmp_path, scan)
+    runner.universe_db = db
+    runner.tick(_et(DAY, 12, 0))
+    assert calls == []
+    assert watch.started is True
+    assert [row["symbol"] for row in watch.candidates] == ["AAPL"]
+
+
+def test_lookback_snapshot_does_not_resume_the_watch(tmp_path):
+    calls = []
+
+    def scan(slot, now):
+        del now
+        calls.append(slot.slot_id)
+        return _Result(True, [])
+
+    db = str(tmp_path / "universe.db")
+    save_universe_snapshots(
+        [
+            {
+                "scan_timestamp": "2026-10-19T18:00:00+00:00",
+                "symbol": "AAPL",
+                "veto_status": "PASS",
+                "veto_reasons": [],
+                "earnings_check": "unavailable",
+                "rank": 1,
+                "final_score": 8,
+            }
+        ],
+        db,
+        snapshot_kind="LOOKBACK",
+    )
+    runner, watch = _runner(tmp_path, scan)
+    runner.universe_db = db
+    runner.tick(_et(DAY, 12, 0))
+    assert calls == []
+    assert watch.started is False
+
+
+def test_a_recorded_slot_is_not_scanned_by_a_second_runner(tmp_path):
+    calls = []
+
+    def scan(slot, now):
+        del now
+        calls.append(slot.slot_id)
+        return _Result(True, [])
+
+    first, _watch = _runner(tmp_path, scan)
+    first.tick(_et(DAY, 10, 45))
+    second, _other = _runner(tmp_path, scan)
+    second.tick(_et(DAY, 10, 46))
+    assert calls == [f"{DAY.isoformat()}T10:45"]
+
+
+def test_manual_action_claims_a_due_slot_once():
+    session = NyseCalendar().session(DAY)
+    due = _et(DAY, 10, 46)
+    assert manual_scan_action(due, session, set()) == "due_slot"
+    assert manual_scan_action(due, session, {f"{DAY.isoformat()}T10:45"}) == "already_recorded"
+    assert manual_scan_action(_et(DAY, 10, 30), session, set()) == "standalone"
+    assert manual_scan_action(_et(date(2026, 1, 1), 10, 45), None, set()) == "standalone"
 
 
 def test_startup_helper_is_unused_when_the_runner_is_constructed(tmp_path):

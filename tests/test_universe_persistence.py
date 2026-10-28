@@ -331,13 +331,13 @@ def test_movement_compares_with_previous_operational_current(tmp_path):
     previous = load_previous_ranks(path, current)
     assert previous == {"AAPL": 5, "MSFT": 1}
 
-    from src.ui.universe_view import latest_table
+    from src.ui.universe_view import rank_movement
 
-    table = latest_table(load_latest_scan(path), previous).set_index("Symbol")
-    assert table.loc["AAPL", "Movement"] == "🔴 ↓3"
-    assert table.loc["MSFT", "Movement"] == "—"
-    assert table.loc["NEW", "Movement"] == "NEW"
-    assert table.loc["POOL", "Movement"] == "NEW"
+    rows = {row["symbol"]: row for row in load_latest_scan(path)}
+    assert rank_movement(rows["AAPL"]["rank"], previous.get("AAPL"))[1] == "🔴 ↓3"
+    assert rank_movement(rows["MSFT"]["rank"], previous.get("MSFT"))[1] == "—"
+    assert rank_movement(rows["NEW"]["rank"], previous.get("NEW"))[1] == "NEW"
+    assert rank_movement(rows["POOL"]["rank"], previous.get("POOL"))[1] == "NEW"
 
 
 def test_identified_run_ignores_legacy_rows_for_movement(tmp_path):

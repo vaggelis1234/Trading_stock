@@ -59,6 +59,7 @@ def search_symbols(
             "scan_timestamp": resolved["scan_timestamp"],
             "run_id": resolved["run_id"],
             "snapshot_kind": resolved["snapshot_kind"],
+            "bar_interval": rows[0].get("bar_interval") if rows else None,
             "total": len(matched),
             "limit": limit,
             "offset": offset,
@@ -75,8 +76,10 @@ def symbol_payload(path: str, symbol: str, range_key: str) -> dict[str, Any]:
             raise SymbolNotFound(symbol)
         since = history_start(current["scan_timestamp"], range_key)
         history = _symbol_history(connection, symbol, since)
+        interval = _known_interval(current.get("bar_interval"))
+        covered = [row for row in history if _known_interval(row.get("bar_interval")) == interval]
         coverage = {
-            name: metric_coverage(history, name, current["scan_timestamp"], range_key)
+            name: metric_coverage(covered, name, current["scan_timestamp"], range_key, interval)
             for name in METRIC_FIELDS
         }
         enrichment = _enrichment(connection, current["scan_timestamp"], symbol)
@@ -89,6 +92,7 @@ def symbol_payload(path: str, symbol: str, range_key: str) -> dict[str, Any]:
             "executed_at": current.get("executed_at"),
             "run_id": current.get("run_id"),
             "snapshot_kind": current.get("snapshot_kind"),
+            "bar_interval": current.get("bar_interval"),
             "range": range_key,
             "since": since,
             "detail": {
@@ -300,6 +304,7 @@ def _scan_payload(
         "executed_at": rows[0].get("executed_at"),
         "run_id": resolved["run_id"],
         "snapshot_kind": resolved["snapshot_kind"],
+        "bar_interval": rows[0].get("bar_interval") if rows else None,
         "evaluated": len(rows),
         "scored": sum(1 for row in rows if row.get("final_score") is not None),
         "passed": passed,
@@ -335,6 +340,7 @@ def _history_row(row: Mapping[str, Any]) -> dict[str, Any]:
         "scan_timestamp": row.get("scan_timestamp"),
         "run_id": row.get("run_id"),
         "snapshot_kind": row.get("snapshot_kind"),
+        "bar_interval": row.get("bar_interval"),
         "status": display_status(row.get("veto_status")),
         "reasons": [reason_text(code) for code in reasons],
         "veto_reasons": reasons,
@@ -344,6 +350,12 @@ def _history_row(row: Mapping[str, Any]) -> dict[str, Any]:
         "atr_percent": _atr_points(row.get("atr_percent")),
         "volume_ratio": _number(row.get("volume_ratio")),
     }
+
+
+def _known_interval(value) -> str:
+    """Universe reads are 30-minute. The value is retained for the call sites."""
+    del value
+    return "30m"
 
 
 def _movement(rank, previous_rank) -> dict[str, Any]:

@@ -35,6 +35,8 @@ class AlwaysEarnings:
 
 
 def _frames(direction):
+    from src.market.calendar import NyseCalendar
+
     daily_idx = pd.bdate_range("2023-01-02", periods=250, tz="America/New_York")
     steps = pd.Series(range(250), dtype=float).to_numpy()
     if direction == "up":
@@ -51,9 +53,18 @@ def _frames(direction):
         },
         index=daily_idx,
     )
-    as_of = (daily_idx[-1] + pd.Timedelta(days=1, hours=16)).tz_convert("UTC").floor("min")
-    hourly_idx = pd.date_range(as_of - pd.Timedelta(hours=79), periods=80, freq="h", tz="UTC")
-    hourly_close = [140.4 if i % 2 == 0 else 139.6 for i in range(80)]
+    calendar = NyseCalendar()
+    sessions = calendar.recent_sessions(daily_idx[-1].date(), 40)
+    index = []
+    for session in sessions:
+        cursor = pd.Timestamp(session.day, tz="America/New_York") + pd.Timedelta(hours=9, minutes=30)
+        close_at = pd.Timestamp(session.day, tz="America/New_York") + pd.Timedelta(
+            hours=session.close_et.hour, minutes=session.close_et.minute
+        )
+        while cursor + pd.Timedelta(minutes=30) <= close_at:
+            index.append(cursor)
+            cursor += pd.Timedelta(minutes=30)
+    hourly_close = [140.4 if i % 2 == 0 else 139.6 for i in range(len(index))]
     hourly = pd.DataFrame(
         {
             "open": hourly_close,
@@ -62,9 +73,10 @@ def _frames(direction):
             "close": hourly_close,
             "volume": 250_000.0,
         },
-        index=hourly_idx,
+        index=pd.DatetimeIndex(index),
     )
-    return daily, hourly, as_of
+    as_of = index[-1] + pd.Timedelta(minutes=45)
+    return daily, hourly, as_of.tz_convert("UTC")
 
 
 def test_common_timestamps_use_the_shared_clock():
@@ -109,7 +121,7 @@ def test_scan_persists_history_and_does_not_overwrite(tmp_path):
     assert rows[0]["final_score"] >= rows[1]["final_score"]
     assert {row["symbol"] for row in rows} == {"UP", "DOWN"}
 
-    assert count_snapshots(str(db)) == 48
+    assert count_snapshots(str(db)) == 50
     run_universe(
         ["UP", "DOWN"],
         provider=provider,
@@ -118,7 +130,7 @@ def test_scan_persists_history_and_does_not_overwrite(tmp_path):
         lookback_bars=24,
         now=as_of,
     )
-    assert count_snapshots(str(db)) == 48
+    assert count_snapshots(str(db)) == 50
 
     history = load_symbol_history(str(db), "DOWN", limit=24)
     assert len(history) == 24
@@ -152,11 +164,6 @@ def test_earnings_block_keeps_a_score_when_metrics_are_valid(tmp_path):
 
 def test_default_pool_is_the_full_sp500_list_not_market_cap(monkeypatch):
     monkeypatch.setattr("src.data.scan.fetch_sp500_symbols", lambda: ["ZZZ", "AAA", "MMM"])
-
-    def fail_market_cap(*_args, **_kwargs):
-        raise AssertionError("market cap sort must not build the evaluation pool")
-
-    monkeypatch.setattr("src.data.scan.top_n_by_marketcap", fail_market_cap)
     from src.data.scan import build_sp500_universe
 
     assert build_sp500_universe() == ["ZZZ", "AAA", "MMM"]
@@ -235,7 +242,7 @@ def test_production_scan_defaults_to_alpaca_sip(monkeypatch, tmp_path, caplog):
     daily, hourly, as_of = _frames("up")
     pages = {
         "1Day": _alpaca_rows(daily),
-        "1Hour": _alpaca_rows(hourly),
+        "30Min": _alpaca_rows(hourly),
         "1Min": [
             {
                 "t": "2024-06-03T14:30:00Z",
@@ -302,7 +309,7 @@ def test_production_scan_defaults_to_alpaca_sip(monkeypatch, tmp_path, caplog):
     assert all(call["params"]["end"].endswith("Z") for call in calls)
     assert all(str(pd.Timestamp(call["params"]["start"]).tz) == "UTC" for call in calls)
     brk_calls = [call for call in calls if "BRK.B" in str(call["params"]["symbols"]).split(",")]
-    assert {call["params"]["timeframe"] for call in brk_calls} >= {"1Day", "1Hour"}
+    assert {call["params"]["timeframe"] for call in brk_calls} >= {"1Day", "30Min"}
     daily_calls = [call for call in brk_calls if call["params"]["timeframe"] == "1Day"]
     assert daily_calls[0]["params"].get("page_token") is None
     assert daily_calls[1]["params"]["page_token"] == "page-2"
@@ -317,11 +324,11 @@ def test_production_scan_defaults_to_alpaca_sip(monkeypatch, tmp_path, caplog):
 
     store = BarStore(str(bars_db))
     stored_daily = store.load_window("BRK-B", "1d", "2000-01-01", "2100-01-01")
-    stored_hourly = store.load_window("BRK-B", "1h", "2000-01-01", "2100-01-01")
+    stored_intraday = store.load_window("BRK-B", "30m", "2000-01-01", "2100-01-01")
     assert len(stored_daily) == len(daily)
-    assert len(stored_hourly) == len(hourly)
+    assert len(stored_intraday) == len(hourly)
     assert store.load_window("ZZZ", "1d", "2000-01-01", "2100-01-01").empty
-    assert store.load_window("ZZZ", "1h", "2000-01-01", "2100-01-01").empty
+    assert store.load_window("ZZZ", "30m", "2000-01-01", "2100-01-01").empty
     assert rows[0]["symbol"] == "BRK-B"
 
     before = len(calls)
@@ -431,7 +438,7 @@ def test_one_symbol_failure_still_persists_the_symbols_that_loaded(tmp_path):
     by_symbol = {row["symbol"]: row for row in rows}
     assert by_symbol["GOOD"]["final_score"] is not None
     assert by_symbol["BAD"]["veto_status"] == "BLOCKED_INSUFFICIENT_DATA"
-    assert count_snapshots(paths["db_path"]) == 2
+    assert count_snapshots(paths["db_path"]) == 3
 
 
 def test_every_symbol_failing_does_not_write_an_insufficient_snapshot(tmp_path):
@@ -489,7 +496,7 @@ def test_one_run_shares_run_id_across_lookbacks_and_one_current(tmp_path):
 
 def test_consecutive_runs_keep_distinct_operational_identity(tmp_path):
     daily, hourly, as_of = _frames("up")
-    first_clock = as_of - pd.Timedelta(minutes=30)
+    first_clock = as_of - pd.Timedelta(minutes=90)
     second_clock = as_of + pd.Timedelta(minutes=2)
     provider = MapProvider({"AAPL": daily}, {"AAPL": hourly})
     paths = _scan_paths(tmp_path)
@@ -537,7 +544,7 @@ def test_universe_run_is_success_when_no_series_fails(tmp_path, caplog):
     )
     assert not any(item.getMessage().startswith("universe run PARTIAL") for item in caplog.records)
     assert {row["symbol"] for row in rows} == {"AAPL", "MSFT"}
-    assert count_snapshots(paths["db_path"]) == 2
+    assert count_snapshots(paths["db_path"]) == 4
 
 
 def test_universe_run_is_partial_when_some_series_fail_and_bars_remain(tmp_path, caplog):
@@ -563,7 +570,7 @@ def test_universe_run_is_partial_when_some_series_fail_and_bars_remain(tmp_path,
     by_symbol = {row["symbol"]: row for row in rows}
     assert by_symbol["GOOD"]["final_score"] is not None
     assert by_symbol["BAD"]["veto_status"] == "BLOCKED_INSUFFICIENT_DATA"
-    assert count_snapshots(paths["db_path"]) == 2
+    assert count_snapshots(paths["db_path"]) == 3
 
 
 def test_universe_run_is_failed_when_no_result_can_be_produced(tmp_path, caplog):

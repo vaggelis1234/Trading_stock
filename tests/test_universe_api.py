@@ -412,7 +412,7 @@ def test_unknown_symbol(tmp_path, monkeypatch):
     assert response.json() == {"error": "symbol_not_found"}
 
 
-def test_symbol_history_covers_1702_scan_as_the_1700_hour(tmp_path, monkeypatch):
+def test_symbol_history_covers_the_30_minute_window_around_the_scan(tmp_path, monkeypatch):
     db = tmp_path / "universe.db"
     path = str(db)
     null_hour = "2026-10-09T15:00:00+00:00"
@@ -459,11 +459,11 @@ def test_symbol_history_covers_1702_scan_as_the_1700_hour(tmp_path, monkeypatch)
     assert body["history"][0]["rsi14"] is None
     assert body["history"][0]["atr_percent"] is None
     coverage = body["coverage"]["RSI"]
-    assert coverage["expected"][-1] == "2026-10-09T15:30:00+00:00"
+    assert coverage["expected"][-1] == "2026-10-09T16:00:00+00:00"
     assert "2026-10-09T17:02:00+00:00" not in coverage["expected"]
     assert "2026-10-08T17:30:00+00:00" in coverage["expected"]
-    assert "2026-10-09T14:30:00+00:00" in coverage["null_metric"]
-    assert null_hour not in coverage["expected"]
+    assert null_hour in coverage["null_metric"]
+    assert null_hour in coverage["expected"]
     assert body["enrichment"] is None
     assert client.get("/api/v1/symbols/AAPL", params={"range": "2D"}).status_code == 422
 
@@ -555,6 +555,7 @@ def test_json_contract_matches_frontend_types(tmp_path, monkeypatch):
         "executed_at",
         "run_id",
         "snapshot_kind",
+        "bar_interval",
         "evaluated",
         "scored",
         "passed",
@@ -583,6 +584,7 @@ def test_json_contract_matches_frontend_types(tmp_path, monkeypatch):
         "scan_timestamp",
         "run_id",
         "snapshot_kind",
+        "bar_interval",
         "total",
         "limit",
         "offset",
@@ -599,6 +601,7 @@ def test_json_contract_matches_frontend_types(tmp_path, monkeypatch):
         "executed_at",
         "run_id",
         "snapshot_kind",
+        "bar_interval",
         "range",
         "since",
         "detail",
@@ -628,6 +631,7 @@ def test_json_contract_matches_frontend_types(tmp_path, monkeypatch):
         "scan_timestamp",
         "run_id",
         "snapshot_kind",
+        "bar_interval",
         "status",
         "reasons",
         "veto_reasons",
@@ -647,12 +651,12 @@ def test_rules_are_the_hardcoded_scan_constants():
     body = _get("/api/v1/rules").json()
     groups = {group["title"]: group for group in body["groups"]}
     vetoes = {row["name"]: row["value"] for row in groups["Hard veto"]["rows"]}
-    assert vetoes["RSI"] == "35 ≤ RSI(14) ≤ 75"
+    assert vetoes["RSI"] == "35 ≤ RSI(28) ≤ 75"
     assert vetoes["Liquidity"] == "ADV20 ≥ $5,000,000"
     windows = {row["name"]: row["value"] for row in groups["Session windows"]["rows"]}
     assert windows["SIP delay"] == "15 minutes after the window ends"
-    assert windows["11:30–12:30"] == "Readable from 12:45"
-    assert windows["12:30–13:30"] == "Readable from 13:45"
+    assert windows["11:30–12:00"] == "Readable from 12:15"
+    assert windows["12:30–13:00"] == "Readable from 13:15"
     assert windows["15:30–16:00"] == "Readable from 16:15"
     assert groups["Ranking"]["rows"][0]["value"] == "Top 100 by score"
 

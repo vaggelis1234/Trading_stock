@@ -1,15 +1,17 @@
-"""Assemble Universe v1 metrics from daily and hourly OHLCV.
+"""Assemble Universe v1 metrics from daily and 30-minute OHLCV.
 
 Daily bars feed the long-term trend (EMA200) and ADV20.
-Hourly bars feed RSI(14), MACD histogram, ATR(14), ATR%, and VolumeRatio.
+30-minute bars feed RSI(28), MACD(24, 52, 18), ATR(28), ATR%, and
+VolumeRatio(40). Those windows cover the same session time as the previous
+hourly windows. Score thresholds are unchanged.
 
 The daily trend uses only sessions that started before the scan's
 America/New_York calendar day. The in-progress session is excluded so a
 same-day daily close cannot leak into EMA200.
 
-Hourly indicators are computed on bars at or before ``as_of``. A bar up to
+Intraday indicators are computed on bars at or before ``as_of``. A bar up to
 two hours older than ``as_of`` may stand in when that exact timestamp is
-missing. Older hourly data is left blank rather than presented as current.
+missing. Older intraday data is left blank rather than presented as current.
 """
 
 import math
@@ -23,9 +25,13 @@ from src.features.indicators import atr, avg_dollar_volume, ema, macd_hist, rsi,
 HOURLY_STALE_AFTER = pd.Timedelta(hours=2)
 EMA_SPAN = 200
 ADV_WINDOW = 20
-RSI_WINDOW = 14
-ATR_WINDOW = 14
-VOLUME_WINDOW = 20
+RSI_WINDOW = 28
+ATR_WINDOW = 28
+VOLUME_WINDOW = 40
+MACD_FAST = 24
+MACD_SLOW = 52
+MACD_SIGNAL = 18
+BAR_INTERVAL = "30m"
 
 
 def as_utc(value) -> pd.Timestamp:
@@ -96,7 +102,7 @@ def precompute_symbol_metrics(daily: pd.DataFrame, hourly: pd.DataFrame) -> dict
     }
     if hourly is not None and not hourly.empty:
         prepared["rsi"] = rsi(hourly, RSI_WINDOW)
-        prepared["macd"] = macd_hist(hourly)
+        prepared["macd"] = macd_hist(hourly, MACD_FAST, MACD_SLOW, MACD_SIGNAL)
         prepared["atr"] = atr(hourly, ATR_WINDOW)
         prepared["volume_ratio"] = volume_ratio(hourly, VOLUME_WINDOW)
     if daily is not None and not daily.empty:

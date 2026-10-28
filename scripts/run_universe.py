@@ -1,4 +1,4 @@
-"""Run one Universe v1 scan and append hourly snapshots.
+"""Run one Universe v1 scan and append 30-minute snapshots.
 
 The default pool is the full S&P 500 constituent list. Every symbol with
 valid metrics is scored, including BLOCKED symbols, and ranked by score.
@@ -50,7 +50,7 @@ def main(argv: list[str] | None = None) -> None:
         default=None,
         help="Optional cap on the S&P 500 pool, in constituent-list order. Omit it to score the full list. This does not rank by market cap.",
     )
-    parser.add_argument("--lookback", type=int, default=24, help="Hourly bars to snapshot, counting backward from the latest bar.")
+    parser.add_argument("--lookback", type=int, default=48, help="30-minute bars to snapshot, counting backward from the latest bar.")
     parser.add_argument("--db", default=os.getenv("UNIVERSE_DB", os.path.join("artifacts", "universe.db")))
     parser.add_argument("--bars-db", default=os.getenv("MARKET_BARS_DB", os.path.join("artifacts", "market_bars.db")))
     parser.add_argument("--artifact-dir", default=os.getenv("ARTIFACT_DIR", "artifacts"))

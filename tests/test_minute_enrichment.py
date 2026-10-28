@@ -1,4 +1,5 @@
 import pandas as pd
+import pytest
 
 from src.data.minute_enrichment import ENRICHMENT_FIELDS, enrich_candidates, enrich_hourly_bar
 
@@ -32,7 +33,7 @@ def _enrich(minutes, as_of=SCAN, hourly_open=100.0, hourly_close=110.0):
 def test_empty_lookup_records_zero_coverage_without_prices():
     record = _enrich(_minutes(HOUR, 0))
     assert record["session_type"] == "REGULAR"
-    assert record["expected_minutes"] == 60
+    assert record["expected_minutes"] == 30
     assert record["observed_minutes"] == 0
     assert record["coverage_ratio"] == 0.0
     assert record["first_price"] is None
@@ -70,43 +71,43 @@ def test_sparse_minutes_use_only_real_bars():
         index=pd.DatetimeIndex(stamps),
     )
     record = _enrich(frame)
-    assert record["observed_minutes"] == 3
-    assert record["coverage_ratio"] == 3 / 60
+    assert record["observed_minutes"] == 2
+    assert record["coverage_ratio"] == 2 / 30
     assert record["first_price"] == 100.0
-    assert record["last_price"] == 111.0
-    assert record["intrahour_return"] == 0.11
-    assert record["intrahour_high"] == 112.0
+    assert record["last_price"] == 99.0
+    assert record["intrahour_return"] == -0.01
+    assert record["intrahour_high"] == 102.0
     assert record["intrahour_low"] == 98.0
-    assert record["close_position"] == (111.0 - 98.0) / (112.0 - 98.0)
-    assert record["minutes_with_signal"] == 2
+    assert record["close_position"] == (99.0 - 98.0) / (102.0 - 98.0)
+    assert record["minutes_with_signal"] == 1
     assert record["minutes_against_signal"] == 1
-    assert record["minute_volume"] == 90.0
+    assert record["minute_volume"] == 40.0
     assert record["top5_volume_share"] == 1.0
-    assert record["last10_volume_share"] == 50.0 / 90.0
+    assert record["last10_volume_share"] == 0.0
     assert record["return_5m"] is None
-    assert record["return_10m"] is None
-    assert record["mfe"] == (112.0 - 100.0) / 100.0
+    assert record["return_10m"] == pytest.approx((99.0 - 101.0) / 101.0)
+    assert record["mfe"] == (102.0 - 100.0) / 100.0
     assert record["mae"] == (100.0 - 98.0) / 100.0
 
 
 def test_full_hour_matches_every_minute_in_the_bar():
-    record = _enrich(_minutes(HOUR, 60))
-    assert record["observed_minutes"] == 60
+    record = _enrich(_minutes(HOUR, 30))
+    assert record["observed_minutes"] == 30
     assert record["coverage_ratio"] == 1.0
     assert record["first_price"] == 100.0
-    assert record["last_price"] == 159.5
-    assert record["intrahour_return"] == 0.595
-    assert record["intrahour_high"] == 159.5
+    assert record["last_price"] == 129.5
+    assert record["intrahour_return"] == 0.295
+    assert record["intrahour_high"] == 129.5
     assert record["intrahour_low"] == 100.0
     assert record["close_position"] == 1.0
-    assert record["minutes_with_signal"] == 60
+    assert record["minutes_with_signal"] == 30
     assert record["minutes_against_signal"] == 0
-    assert record["minute_volume"] == 60.0
-    assert record["top5_volume_share"] == 5 / 60
-    assert record["last10_volume_share"] == 10 / 60
-    assert record["return_5m"] == 5 / 154.5
-    assert record["return_10m"] == 10 / 149.5
-    assert record["mfe"] == 0.595
+    assert record["minute_volume"] == 30.0
+    assert record["top5_volume_share"] == 5 / 30
+    assert record["last10_volume_share"] == 10 / 30
+    assert record["return_5m"] == 5 / 124.5
+    assert record["return_10m"] == 10 / 119.5
+    assert record["mfe"] == 0.295
     assert record["mae"] == 0.0
 
 
@@ -135,7 +136,7 @@ def test_minutes_outside_the_scan_and_the_hour_do_not_count():
     assert dirty == clean
     assert clean["observed_minutes"] == 30
     assert clean["last_price"] == 129.5
-    assert clean["last10_volume_share"] == 0.0
+    assert clean["last10_volume_share"] == 10 / 30
     assert clean["return_5m"] == 5 / 124.5
     assert clean["return_10m"] == 10 / 119.5
     assert clean["minute_volume"] == 30.0
@@ -159,7 +160,7 @@ def test_partial_current_hour_keeps_only_minutes_before_the_scan():
     assert record["scan_timestamp"] == "2026-03-09T17:02:00+00:00"
     assert record["hour_timestamp"] == "2026-03-09T17:00:00+00:00"
     assert record["observed_minutes"] == 2
-    assert record["expected_minutes"] == 60
+    assert record["expected_minutes"] == 30
     assert record["last_price"] == 101.5
     assert record["minute_volume"] == 2.0
 
@@ -171,11 +172,11 @@ def test_previous_hour_stops_at_the_hour_boundary():
     record = enrich_hourly_bar("AAPL", scan, hour, 100.0, 110.0, minutes, scan)
     assert record["hour_timestamp"] == "2026-03-09T16:00:00+00:00"
     assert record["scan_timestamp"] == "2026-03-09T17:02:00+00:00"
-    assert record["observed_minutes"] == 60
-    assert record["expected_minutes"] == 60
+    assert record["observed_minutes"] == 30
+    assert record["expected_minutes"] == 30
     assert record["coverage_ratio"] == 1.0
-    assert record["last_price"] == 159.5
-    assert record["minute_volume"] == 60.0
+    assert record["last_price"] == 129.5
+    assert record["minute_volume"] == 30.0
 
 
 def test_minute_at_or_after_the_scan_is_excluded():

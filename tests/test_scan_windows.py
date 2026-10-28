@@ -9,7 +9,7 @@ from src.data.scan_windows import reconstruct_scheduled_bars
 from src.data.sixty_minute_bars import INCOMPLETE_SIP_DELAY, MISSING_HALF, NAIVE_TIMESTAMP
 from src.market.calendar import NyseCalendar
 from src.universe.pipeline import run_universe
-from src.universe.schedule import session_slots
+from src.universe.schedule import legacy_hourly_slots, session_slots
 from src.universe.scheduled_scan import run_scheduled_universe
 
 DAY = date(2026, 10, 19)
@@ -37,7 +37,7 @@ def _by_label(result):
 
 
 def test_regular_windows_pair_halves_and_leave_the_final_half_hour_alone():
-    slots = session_slots(NyseCalendar().session(DAY))
+    slots = legacy_hourly_slots(NyseCalendar().session(DAY))
     specs = [
         ("09:00", 5, 1),
         ("09:30", 100, 10),
@@ -79,7 +79,7 @@ def test_regular_windows_pair_halves_and_leave_the_final_half_hour_alone():
 
 
 def test_missing_or_delayed_halves_are_not_fabricated():
-    slots = session_slots(NyseCalendar().session(DAY))
+    slots = legacy_hourly_slots(NyseCalendar().session(DAY))
     first = slots[0]
     delayed = reconstruct_scheduled_bars(
         _bars(DAY, [("09:30", 100, 10), ("10:00", 40, 11)]),
@@ -103,7 +103,7 @@ def test_missing_or_delayed_halves_are_not_fabricated():
 
 
 def test_naive_timestamps_produce_no_bar():
-    slots = session_slots(NyseCalendar().session(DAY))
+    slots = legacy_hourly_slots(NyseCalendar().session(DAY))
     index = pd.DatetimeIndex([pd.Timestamp("2026-10-19 09:30")])
     frame = pd.DataFrame([(1, 1, 1, 1, 1)], columns=["open", "high", "low", "close", "volume"], index=index)
     result = reconstruct_scheduled_bars(frame, [slots[0]], _et(DAY, "10:45"))
@@ -112,7 +112,7 @@ def test_naive_timestamps_produce_no_bar():
 
 
 def test_early_close_final_window_is_the_real_last_half_hour():
-    slots = session_slots(NyseCalendar().session(EARLY))
+    slots = legacy_hourly_slots(NyseCalendar().session(EARLY))
     specs = [
         ("09:30", 10, 1),
         ("10:00", 10, 1),
@@ -130,6 +130,29 @@ def test_early_close_final_window_is_the_real_last_half_hour():
     assert built["12:30"].volume == 4
     assert all(bar.timestamp.tz_convert(NY).strftime("%H:%M") != "12:00" for bar in result.bars)
     assert all(bar.volume != 80 for bar in result.bars)
+
+
+def test_session_filter_keeps_0930_and_1530_and_drops_extended_hours():
+    from src.data.scan_windows import regular_completed_30m
+
+    frame = _bars(
+        DAY,
+        [
+            ("09:00", 5, 1),
+            ("09:30", 100, 10),
+            ("15:30", 11, 22),
+            ("16:00", 999, 30),
+            ("16:30", 50, 31),
+        ],
+    )
+    kept = regular_completed_30m(frame, _et(DAY, "16:15"))
+    labels = [stamp.tz_convert(NY).strftime("%H:%M") for stamp in kept.index]
+    assert labels == ["09:30", "15:30"]
+    assert kept.loc[kept.index[0], "volume"] == 100
+    assert kept.loc[kept.index[1], "volume"] == 11
+
+    too_soon = regular_completed_30m(frame, _et(DAY, "16:14"))
+    assert [stamp.tz_convert(NY).strftime("%H:%M") for stamp in too_soon.index] == ["09:30"]
 
 
 def test_thirty_minute_requests_stay_on_the_historical_sip_timeframe():
@@ -195,8 +218,8 @@ def test_scheduled_scan_uses_the_completed_pair_and_skips_a_missing_half(tmp_pat
         hourly_lookback_days=1,
     )
     assert complete.ok is True
-    assert complete.rows[0]["hourly_close"] == 11
-    assert complete.rows[0]["volume"] == 140
+    assert complete.rows[0]["hourly_close"] == 10
+    assert complete.rows[0]["volume"] == 100
     assert provider.calls == []
 
     missing = run_scheduled_universe(
@@ -204,7 +227,7 @@ def test_scheduled_scan_uses_the_completed_pair_and_skips_a_missing_half(tmp_pat
         slot,
         calendar=calendar,
         provider=provider,
-        bars_30m={"AAPL": _bars(DAY, [("09:30", 100, 10)])},
+        bars_30m={"AAPL": _bars(DAY, [("10:00", 40, 11), ("16:00", 50, 9)])},
         daily_frames={"AAPL": prepare_ohlcv(None)},
         db_path=str(tmp_path / "missing.db"),
         bars_db=str(tmp_path / "missing_bars.db"),

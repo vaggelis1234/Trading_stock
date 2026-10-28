@@ -1,6 +1,6 @@
 """Universe v1 scan: data, metrics, hard veto, score, rank, persist.
 
-The scan does not submit orders. Each earlier hourly bar in the lookback
+The scan does not submit orders. Each earlier 30-minute bar in the lookback
 window stays its own snapshot. The latest snapshot is the scan clock. A
 later scan inserts new timestamps and leaves existing rows in place.
 """
@@ -18,6 +18,7 @@ from src.data.bar_store import (
     RUN_FAILED,
     RUN_PARTIAL,
     BarStore,
+    BarSyncStopped,
     bars_db_path,
     describe_bar_sync,
 )
@@ -25,13 +26,51 @@ from src.data.minute_enrichment import enrich_candidates, save_minute_enrichment
 from src.data.provider import AlpacaMarketDataProvider, MarketDataUnavailable, prepare_ohlcv
 from src.persistence.store import SNAPSHOT_CURRENT, SNAPSHOT_LOOKBACK, save_universe_snapshots
 from src.universe.earnings import UnavailableEarningsProvider, earnings_within_48h
-from src.universe.metrics import as_utc, compute_symbol_metrics, metrics_as_of, precompute_symbol_metrics, to_utc_iso
+from src.universe.metrics import (
+    BAR_INTERVAL,
+    as_utc,
+    compute_symbol_metrics,
+    metrics_as_of,
+    precompute_symbol_metrics,
+    to_utc_iso,
+)
 from src.universe.minute_candidates import max_candidates_for_1m, select_minute_candidates
 from src.universe.ranking import rank_snapshots
 from src.universe.scoring import apply_score, load_universe_weights
 from src.universe.veto import apply_hard_vetoes
 
 logger = logging.getLogger(__name__)
+
+
+class UniverseScanStopped(Exception):
+    """The control center asked this scan to stop. Snapshots already written stay stored."""
+
+
+class ScanProgress:
+    """Map completed work units onto a 0–100 percent. 100 is only the finished scan."""
+
+    def __init__(self, total: int, callback):
+        self.total = max(int(total), 1)
+        self.done = 0
+        self.callback = callback
+        self._emit(0)
+
+    def advance(self, count: int = 1) -> None:
+        self.done += count
+        self._emit(min(99, int(self.done * 100 / self.total)))
+
+    def finish(self) -> None:
+        self.done = self.total
+        self._emit(100)
+
+    def _emit(self, percent: int) -> None:
+        if self.callback is not None:
+            self.callback(max(0, min(100, int(percent))))
+
+
+def _raise_if_stopped(stop_check) -> None:
+    if stop_check is not None and stop_check():
+        raise UniverseScanStopped("universe scan stopped")
 
 EMPTY_SCORES = {
     "trend_score": None,
@@ -228,7 +267,7 @@ def run_universe(
     db_path: str = "artifacts/universe.db",
     bars_db: Optional[str] = None,
     artifact_dir: str = "artifacts",
-    lookback_bars: int = 24,
+    lookback_bars: int = 48,
     daily_lookback_days: int = 520,
     hourly_lookback_days: int = 60,
     weights_path: Optional[str] = None,
@@ -236,15 +275,28 @@ def run_universe(
     hourly_frames: Optional[dict] = None,
     daily_frames: Optional[dict] = None,
     require_bar_at=None,
+    stop_check=None,
+    progress=None,
 ) -> list[dict]:
     """Evaluate ``symbols`` and append snapshots. Returns the latest ranked scan.
 
     ``hourly_frames`` and ``daily_frames`` bypass that timeframe's provider
-    sync. The scheduled scan passes session bars reconstructed from completed
-    30-minute SIP bars. ``require_bar_at`` is that scan's window start: a
-    symbol missing it is insufficient data, so an older bar inside the
-    two-hour metric window cannot stand in for the missing print.
+    sync. The scheduled scan passes completed regular-session 30-minute bars.
+    Bars loaded from the provider are filtered to that same session set.
+    ``require_bar_at`` is that scan's window start: a symbol missing it is
+    insufficient data, so an older bar inside the two-hour metric window
+    cannot stand in for the missing print.
+    ``stop_check`` is polled between symbols. A true result stops before the
+    next market-data request or snapshot write.
+    ``progress`` receives percents from 0 through 100. 100 means the scan finished.
     """
+    steps = len(symbols)
+    if daily_frames is None:
+        steps += len(symbols)
+    if hourly_frames is None:
+        steps += len(symbols)
+    scan_progress = ScanProgress(steps, progress)
+    _raise_if_stopped(stop_check)
     run_id = str(uuid.uuid4())
     provider = provider or AlpacaMarketDataProvider()
     earnings = earnings if earnings is not None else UnavailableEarningsProvider()
@@ -260,20 +312,33 @@ def run_universe(
     end_text = end.strftime("%Y-%m-%d")
 
     bars = BarStore(bars_db_path(bars_db))
-    if daily_frames is None:
-        bars.sync_many(provider, symbols, "1d", daily_start, end_text, clock)
-    if hourly_frames is None:
-        bars.sync_many(provider, symbols, "1h", hourly_start, end_text, clock)
+    try:
+        if daily_frames is None:
+            bars.sync_many(
+                provider, symbols, "1d", daily_start, end_text, clock,
+                stop_check=stop_check, on_item=scan_progress.advance,
+            )
+        if hourly_frames is None:
+            bars.sync_many(
+                provider, symbols, BAR_INTERVAL, hourly_start, end_text, clock,
+                stop_check=stop_check, on_item=scan_progress.advance,
+            )
+    except BarSyncStopped as exc:
+        raise UniverseScanStopped("universe scan stopped") from exc
     daily_map = {}
     hourly_map = {}
+    if hourly_frames is None:
+        from src.data.scan_windows import regular_completed_30m
     for symbol in symbols:
+        _raise_if_stopped(stop_check)
         try:
             if daily_frames is None:
                 daily_map[symbol] = bars.load_window(symbol, "1d", daily_start, end_text)
             else:
                 daily_map[symbol] = prepare_ohlcv(daily_frames.get(symbol))
             if hourly_frames is None:
-                hourly_map[symbol] = bars.load_window(symbol, "1h", hourly_start, end_text)
+                loaded = bars.load_window(symbol, BAR_INTERVAL, hourly_start, end_text)
+                hourly_map[symbol] = regular_completed_30m(loaded, clock)
             else:
                 hourly_map[symbol] = prepare_ohlcv(hourly_frames.get(symbol))
         except MarketDataUnavailable:
@@ -292,6 +357,7 @@ def run_universe(
 
     grouped: dict = defaultdict(list)
     for symbol in symbols:
+        _raise_if_stopped(stop_check)
         hourly = hourly_map[symbol]
         daily = daily_map[symbol]
         symbol_times = timestamps if len(hourly) else [timestamps[-1]]
@@ -315,17 +381,25 @@ def run_universe(
                 grouped[as_of].append(_insufficient_row(symbol, as_of, flag))
                 continue
             grouped[as_of].append(_scored_row(symbol, as_of, metrics_as_of(prepared, as_of), flag, weights))
+        scan_progress.advance()
 
     latest: list[dict] = []
     latest_candidates: list[dict] = []
     last_index = len(timestamps) - 1
     for index, as_of in enumerate(timestamps):
+        _raise_if_stopped(stop_check)
         ranked = rank_snapshots(grouped.get(as_of, []))
         if not ranked:
             continue
         candidates = select_minute_candidates(ranked, limit=minute_limit)
         kind = SNAPSHOT_CURRENT if index == last_index else SNAPSHOT_LOOKBACK
-        save_universe_snapshots(ranked, db_path, run_id=run_id, snapshot_kind=kind)
+        save_universe_snapshots(
+            ranked,
+            db_path,
+            run_id=run_id,
+            snapshot_kind=kind,
+            bar_interval=BAR_INTERVAL,
+        )
         latest = ranked
         latest_candidates = candidates
         passed = sum(1 for row in ranked if row["veto_status"] == "PASS")
@@ -339,8 +413,11 @@ def run_universe(
             [row["symbol"] for row in candidates],
         )
 
+    _raise_if_stopped(stop_check)
     _export_latest(latest, artifact_dir)
+    _raise_if_stopped(stop_check)
     if latest_candidates:
         enrichment = enrich_candidates(provider, latest_candidates, hourly_map, bars)
         save_minute_enrichment(db_path, enrichment)
+    scan_progress.finish()
     return latest

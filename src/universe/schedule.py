@@ -1,13 +1,16 @@
 """Universe scan clock for one cash session.
 
 A regular session closes at 16:00 America/New_York. Each scan names the
-completed window it is allowed to read. Windows are half-open and do not
-overlap: the 15:45 scan reads 14:30–15:30, and the 16:15 scan reads only
-15:30–16:00. Nothing here builds a 15:00–16:00 bar.
+completed 30-minute window it is allowed to read. Windows are half-open
+and do not overlap. The 10:15 scan reads 09:30–10:00. The 16:15 scan reads
+only 15:30–16:00. Nothing here reads a bar that starts at the close.
 
 An early close keeps only the windows that finish at or before the real
 close, then adds one final scan 15 minutes after that close. The final
 window is the actual last half hour and never runs past 16:00.
+
+``legacy_hourly_slots`` remains only so the offline comparison script can
+rebuild the old clock. Scans, snapshots, and the UI do not use it.
 """
 
 from __future__ import annotations
@@ -54,7 +57,27 @@ class ScanSlot:
 
 
 def session_slots(session: Optional[SessionHours]) -> tuple[ScanSlot, ...]:
-    """Scans for one session. Weekends and holidays return an empty plan."""
+    """30-minute scans for one session. Weekends and holidays return an empty plan."""
+    if session is None:
+        return ()
+    close = _cap_close(session.close_et)
+    open_at = _at(session.day, REGULAR_OPEN)
+    close_at = _at(session.day, close)
+    final_start = close_at - HALF_HOUR
+    if final_start < open_at:
+        return ()
+    slots = []
+    start = open_at
+    while start + HALF_HOUR <= final_start:
+        slots.append(_slot(session.day, REGULAR, start, start + HALF_HOUR))
+        start += HALF_HOUR
+    slots.append(_slot(session.day, FINAL, final_start, close_at))
+    _require_disjoint(slots)
+    return tuple(slots)
+
+
+def legacy_hourly_slots(session: Optional[SessionHours]) -> tuple[ScanSlot, ...]:
+    """Previous hourly clock, kept for snapshots written before 30-minute scans."""
     if session is None:
         return ()
     close = _cap_close(session.close_et)

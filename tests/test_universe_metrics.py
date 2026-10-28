@@ -5,7 +5,13 @@ import pytest
 from src.data.provider import prepare_ohlcv
 from src.features.indicators import atr, avg_dollar_volume, ema, macd_hist, rsi, volume_ratio
 from src.universe.metrics import (
+    ATR_WINDOW,
     HOURLY_STALE_AFTER,
+    MACD_FAST,
+    MACD_SIGNAL,
+    MACD_SLOW,
+    RSI_WINDOW,
+    VOLUME_WINDOW,
     completed_daily,
     compute_symbol_metrics,
     metrics_as_of,
@@ -142,9 +148,9 @@ def test_metrics_ignore_same_day_daily_bar_and_future_hourly_bar():
     assert metrics["hourly_close"] == pytest.approx(100.0)
     assert metrics["volume"] == pytest.approx(1_000.0)
     assert metrics["volume_ratio"] == pytest.approx(1.0)
-    assert metrics["macd_hist"] == pytest.approx(float(macd_hist(causal).iloc[-1]))
-    assert metrics["rsi14"] == pytest.approx(float(rsi(causal, 14).iloc[-1]))
-    assert metrics["atr14"] == pytest.approx(float(atr(causal, 14).iloc[-1]))
+    assert metrics["macd_hist"] == pytest.approx(float(macd_hist(causal, MACD_FAST, MACD_SLOW, MACD_SIGNAL).iloc[-1]))
+    assert metrics["rsi14"] == pytest.approx(float(rsi(causal, RSI_WINDOW).iloc[-1]))
+    assert metrics["atr14"] == pytest.approx(float(atr(causal, ATR_WINDOW).iloc[-1]))
 
 
 def test_stale_hourly_bars_are_not_reported_as_current():
@@ -206,13 +212,13 @@ def _prefix_metrics(daily, hourly, as_of):
         close = float(hourly_hist["close"].iloc[-1])
         expected["hourly_close"] = None if close <= 0 else close
         expected["volume"] = float(hourly_hist["volume"].iloc[-1])
-        expected["rsi14"] = float(rsi(hourly_hist, 14).iloc[-1])
-        expected["macd_hist"] = float(macd_hist(hourly_hist).iloc[-1])
-        atr14 = float(atr(hourly_hist, 14).iloc[-1])
+        expected["rsi14"] = float(rsi(hourly_hist, RSI_WINDOW).iloc[-1])
+        expected["macd_hist"] = float(macd_hist(hourly_hist, MACD_FAST, MACD_SLOW, MACD_SIGNAL).iloc[-1])
+        atr14 = float(atr(hourly_hist, ATR_WINDOW).iloc[-1])
         expected["atr14"] = atr14
         if expected["hourly_close"] not in (None, 0):
             expected["atr_percent"] = atr14 / expected["hourly_close"]
-        expected["volume_ratio"] = float(volume_ratio(hourly_hist, 20).iloc[-1])
+        expected["volume_ratio"] = float(volume_ratio(hourly_hist, VOLUME_WINDOW).iloc[-1])
     daily_hist = completed_daily(daily_frame, as_of_ts)
     if not daily_hist.empty:
         expected["daily_close"] = float(daily_hist["close"].iloc[-1])

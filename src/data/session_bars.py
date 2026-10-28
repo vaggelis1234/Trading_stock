@@ -124,6 +124,66 @@ def _naive_index(minute_bars: pd.DataFrame) -> bool:
 
 
 def _observed_minutes(et_hour: pd.Timestamp, minute_bars: Optional[pd.DataFrame]) -> Optional[int]:
+    return _observed_in(et_hour, minute_bars, pd.Timedelta(hours=1))
+
+
+HALF_HOUR_MINUTES = 30
+
+
+def classify_half_hour_session(
+    timestamp,
+    minute_bars: Optional[pd.DataFrame] = None,
+) -> HourlySession:
+    """Label one 30-minute bar. ``:00`` and ``:30`` inside the SIP day are valid.
+
+    A bar whose whole window is inside 09:30–16:00 New York is ``REGULAR``.
+    The 09:00 bar is pre-market. The 16:00 bar is after-hours. Expected
+    minute count is 30.
+    """
+    et = _as_new_york(timestamp)
+    if et is None:
+        return _invalid("naive_timestamp")
+    if et.second or et.microsecond or et.nanosecond or int(et.minute) not in (0, 30):
+        return _invalid("off_grid" if not _outside_session(et) else "outside_session")
+    session_type = _half_hour_session_type(et)
+    if session_type is None:
+        reason = "outside_session" if _outside_session(et) else "off_grid"
+        return _invalid(reason)
+    observed = _observed_in(et, minute_bars, pd.Timedelta(minutes=HALF_HOUR_MINUTES))
+    if observed is None and minute_bars is not None and len(minute_bars) > 0 and _naive_index(minute_bars):
+        return HourlySession(
+            valid=True,
+            session_type=session_type,
+            expected_minutes=HALF_HOUR_MINUTES,
+            observed_minutes=None,
+            coverage_ratio=None,
+            reason="naive_minute_index",
+        )
+    ratio = None if observed is None else observed / HALF_HOUR_MINUTES
+    return HourlySession(
+        valid=True,
+        session_type=session_type,
+        expected_minutes=HALF_HOUR_MINUTES,
+        observed_minutes=observed,
+        coverage_ratio=ratio,
+    )
+
+
+def _half_hour_session_type(et: pd.Timestamp) -> Optional[str]:
+    start = et.hour * 60 + et.minute
+    end = start + HALF_HOUR_MINUTES
+    if start < 4 * 60 or start >= 20 * 60:
+        return None
+    if end <= 9 * 60 + 30:
+        return PRE_MARKET
+    if start >= 16 * 60:
+        return AFTER_HOURS
+    if start >= 9 * 60 + 30 and end <= 16 * 60:
+        return REGULAR
+    return MIXED
+
+
+def _observed_in(et_start: pd.Timestamp, minute_bars: Optional[pd.DataFrame], span: pd.Timedelta) -> Optional[int]:
     if minute_bars is None:
         return None
     if len(minute_bars) == 0:
@@ -134,6 +194,6 @@ def _observed_minutes(et_hour: pd.Timestamp, minute_bars: Optional[pd.DataFrame]
     if not isinstance(index, pd.DatetimeIndex):
         index = pd.DatetimeIndex(pd.to_datetime(index, utc=True))
     minutes = index.tz_convert(NEW_YORK).floor("min").unique()
-    window_end = et_hour + pd.Timedelta(hours=1)
-    inside = (minutes >= et_hour) & (minutes < window_end)
+    window_end = et_start + span
+    inside = (minutes >= et_start) & (minutes < window_end)
     return int(inside.sum())

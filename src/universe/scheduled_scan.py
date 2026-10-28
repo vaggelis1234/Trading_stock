@@ -1,9 +1,9 @@
 """Run one scheduled Universe slot through the existing score and rank path.
 
-The hourly frame is the reconstructed session windows only. Scoring,
-ranking, and the hard veto are unchanged. A window that is missing or still
-inside the SIP delay does not become a bar, and the slot is not a successful
-snapshot.
+The intraday frame is completed regular-session Alpaca ``30Min`` bars.
+Scoring, ranking, and the hard veto are unchanged. A window that is missing
+or still inside the SIP delay does not become a bar, and the slot is not a
+successful snapshot.
 """
 
 from __future__ import annotations
@@ -41,20 +41,39 @@ def run_scheduled_universe(
     db_path: str = "artifacts/universe.db",
     bars_db: str | None = None,
     artifact_dir: str = "artifacts",
-    lookback_bars: int = 24,
+    lookback_bars: int = 48,
     hourly_lookback_days: int = 60,
     now: pd.Timestamp | None = None,
     weights_path: str | None = None,
     earnings=None,
+    stop_check=None,
+    progress=None,
 ) -> ScheduledScanResult:
     """Score ``slot`` from completed 30-minute bars. Does not submit orders."""
+    def _relay(percent: int) -> None:
+        if progress is not None:
+            progress(percent)
+
     clock = as_new_york(slot.scan_at if now is None else now)
     sessions = (calendar or NyseCalendar()).recent_sessions(slot.session_date, hourly_lookback_days)
     from src.universe.schedule import session_slots
 
     history = [item for session in sessions for item in session_slots(session)]
     if bars_30m is None:
-        bars_30m = _fetch_30m(provider, symbols, sessions, clock)
+        synced = {"count": 0}
+        symbol_count = max(len(symbols), 1)
+
+        def _on_sync(count: int) -> None:
+            synced["count"] += count
+            _relay(min(70, int(synced["count"] * 70 / symbol_count)))
+
+        bars_30m = _load_cached_30m(
+            provider, symbols, sessions, clock, bars_db, stop_check=stop_check, on_item=_on_sync,
+        )
+        def score_progress(percent: int) -> None:
+            _relay(min(100, 70 + int(percent * 30 / 100)))
+    else:
+        score_progress = _relay
     hourly_frames = {}
     reasons = []
     for symbol in symbols:
@@ -80,6 +99,8 @@ def run_scheduled_universe(
         symbols,
         provider=provider,
         earnings=earnings,
+        stop_check=stop_check,
+        progress=score_progress,
         db_path=db_path,
         bars_db=bars_db,
         artifact_dir=artifact_dir,
@@ -100,14 +121,22 @@ def _contains(frame: pd.DataFrame, slot: ScanSlot) -> bool:
     return slot.window_start.tz_convert("UTC").floor("min") in prepared.index
 
 
-def _fetch_30m(provider, symbols: list[str], sessions, clock: pd.Timestamp) -> dict:
+def _load_cached_30m(provider, symbols: list[str], sessions, clock: pd.Timestamp, bars_db: str | None, stop_check=None, on_item=None) -> dict:
+    """Sync ``30m`` through the bar cache, then return the stored window.
+
+    The first scan backfills the lookback. A later scan refreshes the cache
+    tail instead of requesting the whole lookback again.
+    """
     if provider is None or not sessions:
         return {symbol: pd.DataFrame() for symbol in symbols}
+    from src.data.bar_store import BarStore, BarSyncStopped
+    from src.universe.pipeline import UniverseScanStopped
+
     start = sessions[0].day.isoformat()
     end = (clock + pd.Timedelta(minutes=1)).tz_convert("UTC").isoformat()
-    batch = provider.get_bars_many(symbols, start, end, "30m")
-    frames = {symbol: batch.frames.get(symbol, pd.DataFrame()) for symbol in symbols}
-    for symbol in batch.failed:
-        logger.warning("30-minute SIP fetch failed for %s", symbol)
-        frames[symbol] = pd.DataFrame()
-    return frames
+    store = BarStore(bars_db)
+    try:
+        store.sync_many(provider, symbols, "30m", start, end, clock, stop_check=stop_check, on_item=on_item)
+    except BarSyncStopped as exc:
+        raise UniverseScanStopped("universe scan stopped") from exc
+    return {symbol: store.load_window(symbol, "30m", start, end) for symbol in symbols}

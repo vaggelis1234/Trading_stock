@@ -3,7 +3,17 @@
 from datetime import date
 
 from src.market.calendar import REGULAR_CLOSE, REGULAR_OPEN, SessionHours
-from src.universe.metrics import ADV_WINDOW, ATR_WINDOW, EMA_SPAN, HOURLY_STALE_AFTER, RSI_WINDOW, VOLUME_WINDOW
+from src.universe.metrics import (
+    ADV_WINDOW,
+    ATR_WINDOW,
+    EMA_SPAN,
+    HOURLY_STALE_AFTER,
+    MACD_FAST,
+    MACD_SIGNAL,
+    MACD_SLOW,
+    RSI_WINDOW,
+    VOLUME_WINDOW,
+)
 from src.universe.minute_candidates import max_candidates_for_1m
 from src.universe.ranking import TOP_N
 from src.universe.schedule import SIP_DELAY, session_slots
@@ -84,14 +94,15 @@ def _indicators() -> dict:
     stale_hours = int(HOURLY_STALE_AFTER.total_seconds() // 3600)
     return {
         "title": "Indicator windows",
-        "note": "Daily trend uses completed sessions only. An hourly bar older than the stale limit is not used.",
+        "note": "Daily trend uses completed sessions only. A 30-minute bar older than the stale limit is not used.",
         "rows": [
             {"name": "EMA", "value": f"{EMA_SPAN} daily closes"},
             {"name": "ADV", "value": f"{ADV_WINDOW} daily dollar-volume sessions"},
-            {"name": "RSI", "value": f"{RSI_WINDOW} hourly bars"},
-            {"name": "ATR", "value": f"{ATR_WINDOW} hourly bars"},
-            {"name": "VolumeRatio", "value": f"{VOLUME_WINDOW} hourly bars"},
-            {"name": "Hourly freshness", "value": f"{stale_hours} hours"},
+            {"name": "RSI", "value": f"{RSI_WINDOW} 30-minute bars"},
+            {"name": "MACD", "value": f"{MACD_FAST}, {MACD_SLOW}, {MACD_SIGNAL} 30-minute bars"},
+            {"name": "ATR", "value": f"{ATR_WINDOW} 30-minute bars"},
+            {"name": "VolumeRatio", "value": f"{VOLUME_WINDOW} 30-minute bars"},
+            {"name": "Bar freshness", "value": f"{stale_hours} hours"},
         ],
     }
 
@@ -106,7 +117,7 @@ def _windows() -> dict:
         rows.append({"name": f"{start}–{end}", "value": f"Readable from {ready}"})
     return {
         "title": "Session windows",
-        "note": "Regular cash session, America/New_York. Windows do not overlap. The last one is the closing half hour.",
+        "note": "Regular cash session, America/New_York. Each window is 30 minutes. Windows do not overlap. The last one ends at the official close.",
         "rows": rows,
     }
 

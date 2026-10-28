@@ -144,6 +144,8 @@ def _ensure_run_identity(cur: sqlite3.Cursor) -> None:
         cur.execute("ALTER TABLE universe_snapshots ADD COLUMN run_id TEXT")
     if "snapshot_kind" not in names:
         cur.execute("ALTER TABLE universe_snapshots ADD COLUMN snapshot_kind TEXT")
+    if "bar_interval" not in names:
+        cur.execute("ALTER TABLE universe_snapshots ADD COLUMN bar_interval TEXT")
 
 
 def _execution_stamp(executed_at: Optional[str]) -> str:
@@ -164,6 +166,7 @@ def save_universe_snapshots(
     executed_at: Optional[str] = None,
     run_id: Optional[str] = None,
     snapshot_kind: Optional[str] = None,
+    bar_interval: Optional[str] = None,
 ) -> int:
     """Insert snapshots. Existing (scan_timestamp, symbol) rows are left unchanged.
 
@@ -173,14 +176,20 @@ def save_universe_snapshots(
     ``run_id`` and ``snapshot_kind`` are execution identity. Both stay NULL
     when the caller does not supply them. An existing row keeps the identity
     it was first stored with.
+
+    ``bar_interval`` is ``30m``. A caller that omits it still stores ``30m``.
     """
     if snapshot_kind is not None and snapshot_kind not in SNAPSHOT_KINDS:
         raise ValueError(f"unknown snapshot_kind: {snapshot_kind}")
+    if bar_interval is None:
+        bar_interval = "30m"
+    if bar_interval != "30m":
+        raise ValueError(f"unknown bar_interval: {bar_interval}")
     init_universe_db(path)
     conn = sqlite3.connect(path)
     cur = conn.cursor()
     before = cur.execute("SELECT COUNT(*) FROM universe_snapshots").fetchone()[0]
-    stored_columns = SNAPSHOT_COLUMNS + ["executed_at", "run_id", "snapshot_kind"]
+    stored_columns = SNAPSHOT_COLUMNS + ["executed_at", "run_id", "snapshot_kind", "bar_interval"]
     columns = ", ".join(stored_columns)
     placeholders = ", ".join(["?"] * len(stored_columns))
     execution_stamp = _execution_stamp(executed_at)
@@ -196,6 +205,7 @@ def save_universe_snapshots(
         values.append(execution_stamp)
         values.append(run_id)
         values.append(snapshot_kind)
+        values.append(bar_interval)
         cur.execute(
             f"INSERT OR IGNORE INTO universe_snapshots ({columns}) VALUES ({placeholders})",
             values,
@@ -212,6 +222,7 @@ def _parse_snapshot(row: sqlite3.Row) -> Dict[str, Any]:
     parsed["executed_at"] = row["executed_at"] if "executed_at" in keys else None
     parsed["run_id"] = row["run_id"] if "run_id" in keys else None
     parsed["snapshot_kind"] = row["snapshot_kind"] if "snapshot_kind" in keys else None
+    parsed["bar_interval"] = row["bar_interval"] if "bar_interval" in keys else None
     raw_reasons = parsed.get("veto_reasons")
     if not raw_reasons:
         parsed["veto_reasons"] = []

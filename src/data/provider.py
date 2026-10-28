@@ -90,7 +90,9 @@ _ALPACA_MAX_PAGES = 500
 # The bars endpoint does not publish a symbol cap. Stay under a short query
 # and under the 10_000-bar page, whichever is smaller for the window.
 ALPACA_SYMBOL_BATCH_CAP = 50
-_SIP_RECENT_DELAY = pd.Timedelta(minutes=15)
+# Fifteen minutes is still inside the window this subscription rejects
+# ("subscription does not permit querying recent SIP data"). Sixteen clears it.
+_SIP_RECENT_DELAY = pd.Timedelta(minutes=16)
 _ALPACA_FROM_WIRE = {remote: local for local, remote in _ALPACA_SYMBOLS.items()}
 
 
@@ -168,10 +170,12 @@ class _Attempt:
 
 
 def _sip_request_end(requested: pd.Timestamp) -> pd.Timestamp:
-    """Keep a SIP query out of the trailing 15 minutes.
+    """Keep a SIP query out of the trailing 16 minutes.
 
     This subscription rejects the whole request when ``end`` reaches recent
-    SIP data. Older bars in the same window stay available.
+    SIP data, including an end exactly 15 minutes ago. Older bars in the
+    same window stay available. Scan timing still waits 15 minutes after
+    a window ends; the extra minute is only the query bound.
     """
     latest = pd.Timestamp.now(tz="UTC") - _SIP_RECENT_DELAY
     if requested > latest:

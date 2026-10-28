@@ -1,12 +1,12 @@
 """Completed session windows for a scheduled Universe scan.
 
-Sixty-minute windows are two completed ``30Min`` bars. The final window of
-the session is the last half hour and stays 30 minutes. Bars that have not
-finished, that are inside the Historical SIP delay, or that sit in
-pre-market or after-hours are rejected. A missing half is not filled in.
+A scan slot names the Alpaca ``30Min`` bars it may read. A 30-minute slot
+uses that one completed bar. A legacy hourly slot still pairs two completed
+halves; new scans do not build those slots. Bars that have not finished,
+that are inside the Historical SIP delay, or that sit outside the cash
+session are rejected. A missing bar is not filled in.
 
-This is the scan clock. It does not build the overlapping 15:00–16:00 hour
-and it does not read a closing print.
+The bar that starts at the session close is not a regular-session bar.
 """
 
 from __future__ import annotations
@@ -29,6 +29,7 @@ from src.data.sixty_minute_bars import (
     THIRTY_MINUTES,
     BarRejection,
 )
+from src.market.calendar import NyseCalendar
 from src.universe.schedule import NEW_YORK, ScanSlot, as_new_york
 
 BAR_COLUMNS = ("open", "high", "low", "close", "volume")
@@ -233,3 +234,41 @@ def _as_utc(value):
 
 def _on_half_grid(et: pd.Timestamp) -> bool:
     return et.minute in (0, 30) and et.second == 0 and et.microsecond == 0 and et.nanosecond == 0
+
+
+def regular_completed_30m(frame: pd.DataFrame, as_of, calendar: Optional[NyseCalendar] = None) -> pd.DataFrame:
+    """Keep completed regular-session ``30Min`` bars. The close bar stays out.
+
+    ``frame`` may contain the extended-hours bars Alpaca returns. A bar is
+    kept only when its whole ``[start, start + 30min)`` window sits inside
+    that date's official cash session and ``as_of`` is at least the SIP delay
+    after the window ends. Volume is the provider's volume.
+    """
+    from src.data.provider import prepare_ohlcv
+
+    prepared = prepare_ohlcv(frame)
+    if prepared.empty:
+        return prepared
+    as_of_utc, naive = _as_utc(as_of)
+    if naive or as_of_utc is None:
+        return prepare_ohlcv(None)
+    calendar = calendar or NyseCalendar()
+    kept = []
+    for stamp in prepared.index:
+        et = pd.Timestamp(stamp).tz_convert(NEW_YORK)
+        if not _on_half_grid(et):
+            continue
+        session = calendar.session(et.date())
+        if session is None:
+            continue
+        open_at = et.normalize() + pd.Timedelta(hours=9, minutes=30)
+        close_at = et.normalize() + pd.Timedelta(hours=session.close_et.hour, minutes=session.close_et.minute)
+        window_end = et + THIRTY_MINUTES
+        if et < open_at or window_end > close_at:
+            continue
+        if as_of_utc < window_end.tz_convert("UTC") + SIP_RECENT_DELAY:
+            continue
+        kept.append(stamp)
+    if not kept:
+        return prepare_ohlcv(None)
+    return prepared.loc[kept]

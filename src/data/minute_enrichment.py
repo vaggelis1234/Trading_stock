@@ -1,7 +1,7 @@
-"""Raw 1-minute facts for PASS candidates already chosen by the hourly ranking.
+"""Raw 1-minute facts for PASS candidates already chosen by the 30-minute ranking.
 
-The numbers describe the last hourly bar that is available at the scan.
-Minutes at or after the scan, and minutes outside that hour, are ignored.
+The numbers describe the last completed 30-minute bar available at the scan.
+Minutes at or after the scan, and minutes outside that bar, are ignored.
 Nothing here changes a score, a rank, a veto, or an order.
 """
 
@@ -14,7 +14,7 @@ from typing import Optional, Sequence
 import pandas as pd
 
 from src.data.provider import prepare_ohlcv
-from src.data.session_bars import classify_hourly_session
+from src.data.session_bars import classify_half_hour_session
 from src.universe.metrics import HOURLY_STALE_AFTER
 
 logger = logging.getLogger(__name__)
@@ -64,7 +64,7 @@ def enrich_hourly_bar(
     hour_start = _as_utc(hour_timestamp)
     scan = _as_utc(as_of).floor("min")
     window_end = _minute_window_end(hour_start, scan)
-    session = classify_hourly_session(hour_start, _empty_minutes(hour_start) if minute_bars is not None else None)
+    session = classify_half_hour_session(hour_start, _empty_minutes(hour_start) if minute_bars is not None else None)
     record = _blank(symbol, scan, hour_start, session)
     if minute_bars is None or window_end <= hour_start:
         if minute_bars is not None and window_end <= hour_start and session.valid:
@@ -82,7 +82,7 @@ def enrich_hourly_bar(
         record["coverage_ratio"] = None
         return record
 
-    session = classify_hourly_session(hour_start, window)
+    session = classify_half_hour_session(hour_start, window)
     record["session_type"] = session.session_type
     record["expected_minutes"] = session.expected_minutes
     record["observed_minutes"] = session.observed_minutes
@@ -116,8 +116,8 @@ def enrich_hourly_bar(
     if volume > 0:
         top = window["volume"].nlargest(min(5, len(window))).sum()
         record["top5_volume_share"] = float(top) / volume
-        last_start = hour_start + pd.Timedelta(minutes=50)
-        tail = window.loc[(window.index >= last_start) & (window.index < hour_start + pd.Timedelta(hours=1))]
+        last_start = hour_start + pd.Timedelta(minutes=20)
+        tail = window.loc[(window.index >= last_start) & (window.index < hour_start + pd.Timedelta(minutes=30))]
         record["last10_volume_share"] = float(tail["volume"].sum()) / volume
 
     record["return_5m"] = _lag_return(window, 5, hour_start)
@@ -216,12 +216,12 @@ def _empty_minutes(hour_start) -> pd.DataFrame:
 
 
 def _minute_window_end(hour_start, scan):
-    """Exclusive end of the causal minute window for one hourly bar.
+    """Exclusive end of the causal minute window for one 30-minute bar.
 
-    Minutes belong to ``[hour_start, hour_start + 1h)`` and must also be
-    strictly before the scan. A minute of the next hour stays out.
+    Minutes belong to ``[bar_start, bar_start + 30min)`` and must also be
+    strictly before the scan. A minute of the next bar stays out.
     """
-    return min(_as_utc(hour_start) + pd.Timedelta(hours=1), _as_utc(scan).floor("min"))
+    return min(_as_utc(hour_start) + pd.Timedelta(minutes=30), _as_utc(scan).floor("min"))
 
 
 def _causal_minutes(minute_bars: pd.DataFrame, hour_start, window_end):

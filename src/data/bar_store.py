@@ -38,7 +38,22 @@ _SESSION_COLUMN_SQL = {
 }
 TAIL_CALENDAR_DAYS = 7
 HOURLY_OVERLAP = pd.Timedelta(hours=2)
+
+
+class BarSyncStopped(Exception):
+    """A caller asked the bar sync to stop before the next request."""
+
+
+def _raise_if_sync_stopped(stop_check) -> None:
+    if stop_check is not None and stop_check():
+        raise BarSyncStopped("bar sync stopped")
+
+
+def _count_item(on_item, count: int) -> None:
+    if on_item is not None and count:
+        on_item(count)
 SESSION_CLOSE_HOUR = 16
+_INTRADAY_INTERVALS = frozenset({"1h", "30m"})
 
 _BAR_UPSERT = """
 INSERT INTO market_bars (
@@ -202,7 +217,7 @@ def completed_session_close(clock) -> pd.Timestamp:
 def _completed_overlap_bar(interval: str, bar_ts: pd.Timestamp, clock, newest: pd.Timestamp) -> bool:
     """True when a changed bar is historical rather than still forming."""
     bar_ts = _as_utc(bar_ts)
-    if interval == "1h":
+    if interval in _INTRADAY_INTERVALS:
         return bar_ts <= _as_utc(newest) - HOURLY_OVERLAP
     session_start = _as_utc(clock).tz_convert("America/New_York").normalize()
     return bar_ts.tz_convert("America/New_York").normalize() < session_start
@@ -362,28 +377,46 @@ class BarStore:
             logger.info("bar sync %s %s %s", action, symbol, interval)
         return action
 
-    def sync_many(self, provider, symbols: list[str], interval: str, required_start: str, required_end: str, clock) -> None:
+    def sync_many(
+        self,
+        provider,
+        symbols: list[str],
+        interval: str,
+        required_start: str,
+        required_end: str,
+        clock,
+        stop_check=None,
+        on_item=None,
+    ) -> None:
         """Sync one timeframe for many symbols, batching identical windows.
 
         Providers without ``get_bars_many`` keep the per-symbol ``sync`` path.
         A failed batch does not advance coverage and does not delete bars.
+        ``stop_check`` is polled between symbols or batches. A true result
+        stops before the next request and leaves stored bars in place.
         """
+        _raise_if_sync_stopped(stop_check)
         if not hasattr(provider, "get_bars_many"):
             for symbol in symbols:
+                _raise_if_sync_stopped(stop_check)
                 self.sync(provider, symbol, interval, required_start, required_end, clock)
+                _count_item(on_item, 1)
             return
         groups: dict[tuple[str, str], list[tuple[str, str]]] = {}
         for symbol in symbols:
             plan = self._plan_fetch(symbol, interval, required_start, required_end, clock)
             if plan is None:
                 self._note("skipped", symbol, interval)
+                _count_item(on_item, 1)
                 continue
             groups.setdefault((plan[0], plan[1]), []).append((symbol, plan[2]))
         for (start, end), planned in groups.items():
             size = batch_size_for_window(interval, start, end)
             for offset in range(0, len(planned), size):
+                _raise_if_sync_stopped(stop_check)
                 chunk = planned[offset:offset + size]
                 self._sync_chunk(provider, chunk, interval, start, end, required_start, required_end, clock)
+                _count_item(on_item, len(chunk))
 
     def _plan_fetch(self, symbol: str, interval: str, required_start: str, required_end: str, clock):
         """Return ``(request_start, request_end, kind)`` or ``None`` when the series is fresh."""
@@ -394,7 +427,7 @@ class BarStore:
             return (required_start, required_end, "backfilled")
         if interval == "1d" and _as_utc(state["checked_through"]) >= completed_session_close(clock):
             return None
-        if interval == "1h" and _as_utc(state["checked_through"]) >= _as_utc(clock).floor("min"):
+        if interval in _INTRADAY_INTERVALS and _as_utc(state["checked_through"]) >= _as_utc(clock).floor("min"):
             return None
         return (self._tail_start(interval, required_start, state), required_end, "refreshed")
 
@@ -485,7 +518,7 @@ class BarStore:
 
         if interval == "1d" and _as_utc(state["checked_through"]) >= completed_session_close(clock):
             return "skipped"
-        if interval == "1h" and _as_utc(state["checked_through"]) >= _as_utc(clock).floor("min"):
+        if interval in _INTRADAY_INTERVALS and _as_utc(state["checked_through"]) >= _as_utc(clock).floor("min"):
             return "skipped"
 
         request_start = self._tail_start(interval, required_start, state)
@@ -520,7 +553,7 @@ class BarStore:
     def _tail_start(self, interval: str, required_start: str, state) -> str:
         anchor = state["latest_bar"] or state["checked_through"]
         anchor_ts = _as_utc(anchor)
-        if interval == "1h":
+        if interval in _INTRADAY_INTERVALS:
             anchor_ts = anchor_ts - HOURLY_OVERLAP
         start_ts = anchor_ts - pd.Timedelta(days=TAIL_CALENDAR_DAYS - 1)
         start_text = start_ts.strftime("%Y-%m-%d")

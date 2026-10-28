@@ -5,6 +5,7 @@ import pandas as pd
 import pytest
 
 from src.data.bar_store import HOURLY_OVERLAP, BarStore, completed_session_close
+from src.data.scan_windows import regular_completed_30m
 from src.data.provider import prepare_ohlcv
 from src.persistence.store import SNAPSHOT_COLUMNS
 from src.universe.metrics import compute_symbol_metrics
@@ -131,6 +132,25 @@ def test_stale_coverage_requests_a_short_tail(tmp_path):
     assert (pd.Timestamp(requested) - pd.Timestamp(hourly_start)).days > 30
     latest = pd.Timestamp(store.coverage("AAPL", "1h")["latest_bar"])
     assert requested <= (latest - HOURLY_OVERLAP).strftime("%Y-%m-%d")
+
+
+def test_30m_refresh_requests_a_tail_not_the_full_lookback(tmp_path):
+    clock = pd.Timestamp("2026-09-16 20:30", tz="UTC")
+    later = clock + pd.Timedelta(minutes=30)
+    _daily_start, lookback_start, end = _window(clock)
+    _, _, later_end = _window(later)
+    index = pd.date_range(clock - pd.Timedelta(hours=10), periods=11, freq="30min", tz="UTC")
+    provider = RecordingProvider({"30m": _ohlcv(index, [20.0 + i for i in range(len(index))])})
+    store = BarStore(str(tmp_path / "market_bars.db"))
+    store.sync(provider, "AAPL", "30m", lookback_start, end, clock)
+    provider.calls.clear()
+
+    action = store.sync(provider, "AAPL", "30m", lookback_start, later_end, later)
+    assert action == "refreshed"
+    requested = provider.calls[0]["start"]
+    assert requested > lookback_start
+    assert (pd.Timestamp(requested) - pd.Timestamp(lookback_start)).days > 30
+    assert provider.calls[0]["interval"] == "30m"
 
 
 def test_daily_session_refresh_skips_when_checked_and_does_not_retry_the_weekend(tmp_path):
@@ -488,16 +508,28 @@ def test_metrics_match_the_full_provider_frame_across_session_and_staleness(tmp_
 
 
 def test_universe_snapshots_match_direct_evaluation(tmp_path):
-    clock = pd.Timestamp("2026-09-16 20:30", tz="UTC")
+    from src.market.calendar import NyseCalendar
+
+    day = pd.Timestamp("2026-09-16", tz="America/New_York")
+    sessions = NyseCalendar().recent_sessions(day.date(), 40)
+    index = []
+    for session in sessions:
+        cursor = pd.Timestamp(session.day, tz="America/New_York") + pd.Timedelta(hours=9, minutes=30)
+        close_at = pd.Timestamp(session.day, tz="America/New_York") + pd.Timedelta(
+            hours=session.close_et.hour, minutes=session.close_et.minute
+        )
+        while cursor + pd.Timedelta(minutes=30) <= close_at:
+            index.append(cursor)
+            cursor += pd.Timedelta(minutes=30)
+    clock = (index[-1] + pd.Timedelta(minutes=45)).tz_convert("UTC")
     daily_up = _ohlcv(_daily_index(clock, periods=220), [100.0 + i * 0.2 for i in range(220)])
     daily_down = _ohlcv(_daily_index(clock, periods=220), [160.0 - i * 0.2 for i in range(220)])
-    hourly_idx = pd.date_range(clock - pd.Timedelta(hours=30), periods=30, freq="h", tz="UTC")
-    hourly = _ohlcv(hourly_idx, [140.0 + (i % 2) for i in range(30)], volume=250_000.0)
+    hourly = _ohlcv(pd.DatetimeIndex(index), [140.0 + (i % 2) for i in range(len(index))], volume=250_000.0)
     frames = {
         ("UP", "1d"): daily_up,
-        ("UP", "1h"): hourly,
+        ("UP", "30m"): hourly,
         ("DOWN", "1d"): daily_down,
-        ("DOWN", "1h"): hourly,
+        ("DOWN", "30m"): hourly,
     }
 
     class MapProvider:
@@ -508,7 +540,7 @@ def test_universe_snapshots_match_direct_evaluation(tmp_path):
             self.calls.append((symbol, start, end, interval))
             if interval == "1m":
                 return pd.DataFrame(columns=["open", "high", "low", "close", "volume"])
-            return frames[(symbol, interval)]
+            return frames[(symbol, "30m" if interval == "30m" else interval)]
 
     provider = MapProvider()
     db = tmp_path / "universe.db"
@@ -528,17 +560,18 @@ def test_universe_snapshots_match_direct_evaluation(tmp_path):
     prepared = {}
     for symbol in ("UP", "DOWN"):
         prepared[(symbol, "1d")] = prepare_ohlcv(frames[(symbol, "1d")])
-        prepared[(symbol, "1h")] = prepare_ohlcv(frames[(symbol, "1h")])
+        clipped = prepare_ohlcv(frames[(symbol, "30m")])
+        clipped = clipped[
+            (clipped.index >= pd.Timestamp(hourly_start, tz="UTC"))
+            & (clipped.index < pd.Timestamp(end, tz="UTC"))
+        ]
+        prepared[(symbol, "30m")] = regular_completed_30m(clipped, clock)
         prepared[(symbol, "1d")] = prepared[(symbol, "1d")][
             (prepared[(symbol, "1d")].index >= pd.Timestamp(daily_start, tz="UTC"))
             & (prepared[(symbol, "1d")].index < pd.Timestamp(end, tz="UTC"))
         ]
-        prepared[(symbol, "1h")] = prepared[(symbol, "1h")][
-            (prepared[(symbol, "1h")].index >= pd.Timestamp(hourly_start, tz="UTC"))
-            & (prepared[(symbol, "1h")].index < pd.Timestamp(end, tz="UTC"))
-        ]
     timestamps = _snapshot_timestamps(
-        common_timestamps({symbol: prepared[(symbol, "1h")] for symbol in ("UP", "DOWN")}, 4),
+        common_timestamps({symbol: prepared[(symbol, "30m")] for symbol in ("UP", "DOWN")}, 4),
         clock,
     )
     weights = load_universe_weights()
@@ -546,7 +579,7 @@ def test_universe_snapshots_match_direct_evaluation(tmp_path):
     for as_of in timestamps:
         ranked = rank_snapshots(
             [
-                evaluate_symbol(symbol, prepared[(symbol, "1d")], prepared[(symbol, "1h")], as_of, None, weights)
+                evaluate_symbol(symbol, prepared[(symbol, "1d")], prepared[(symbol, "30m")], as_of, None, weights)
                 for symbol in ("UP", "DOWN")
             ]
         )
