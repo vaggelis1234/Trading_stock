@@ -703,3 +703,39 @@ def test_ohlcv_refresh_keeps_session_metadata(tmp_path):
     assert kept.coverage_ratio == 1 / 60
     reloaded = store.load_window("AAPL", "1h", "2026-03-01", "2026-03-10")
     assert reloaded.loc[stamp.tz_convert("UTC"), "close"] == 10.5
+
+
+def test_30m_sync_stores_only_cash_session_bars(tmp_path):
+    clock = pd.Timestamp("2026-10-16 20:30", tz="UTC")
+    index = pd.DatetimeIndex(
+        [
+            pd.Timestamp("2026-10-16 08:00", tz="UTC"),
+            pd.Timestamp("2026-10-16 13:30", tz="UTC"),
+            pd.Timestamp("2026-10-16 19:30", tz="UTC"),
+            pd.Timestamp("2026-10-16 20:00", tz="UTC"),
+        ]
+    )
+    provider = RecordingProvider({"30m": _ohlcv(index, [1.0, 2.0, 3.0, 4.0])})
+    store = BarStore(str(tmp_path / "market_bars.db"))
+    store.sync(provider, "AAPL", "30m", "2026-10-01", "2026-10-17", clock)
+    loaded = store.load_window("AAPL", "30m", "2026-10-01", "2026-10-17")
+    labels = [stamp.tz_convert("America/New_York").strftime("%H:%M") for stamp in loaded.index]
+    assert labels == ["09:30", "15:30"]
+
+
+def test_sync_many_deletes_extended_hours_already_stored(tmp_path):
+    store = BarStore(str(tmp_path / "market_bars.db"))
+    conn = sqlite3.connect(store.path)
+    conn.execute(
+        """INSERT INTO market_bars
+           (symbol, interval, bar_timestamp, open, high, low, close, volume)
+           VALUES ('AAPL', '30m', '2026-10-16T08:00:00+00:00', 1, 1, 1, 1, 1),
+                  ('AAPL', '30m', '2026-10-16T13:30:00+00:00', 2, 2, 2, 2, 2)"""
+    )
+    conn.commit()
+    conn.close()
+    provider = RecordingProvider()
+    store.sync_many(provider, [], "30m", "2026-10-01", "2026-10-17", pd.Timestamp("2026-10-16 20:30", tz="UTC"))
+    loaded = store.load_window("AAPL", "30m", "2026-10-01", "2026-10-17")
+    labels = [stamp.tz_convert("America/New_York").strftime("%H:%M") for stamp in loaded.index]
+    assert labels == ["09:30"]

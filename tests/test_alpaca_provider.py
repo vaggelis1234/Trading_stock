@@ -381,3 +381,42 @@ def test_daily_weekday_is_in_session_and_weekend_is_not():
     assert module.in_expected_session(weekday, "1d") is True
     assert module.in_expected_session(weekend, "1d") is False
     assert module.in_expected_session(pd.Timestamp("2024-01-06T15:00:00Z"), "1h") is False
+
+
+def test_thirty_minute_requests_stay_inside_cash_sessions(monkeypatch):
+    pages = {
+        None: {
+            "bars": {
+                "AAPL": [
+                    _bar("2026-10-16T13:00:00Z", 1),
+                    _bar("2026-10-16T13:30:00Z", 10),
+                    _bar("2026-10-16T19:30:00Z", 11),
+                    _bar("2026-10-16T20:00:00Z", 12),
+                    _bar("2026-10-17T14:00:00Z", 13),
+                ]
+            },
+            "next_page_token": None,
+        }
+    }
+    provider, session = _provider(monkeypatch, pages)
+    frame = provider.get_bars("AAPL", "2026-10-16", "2026-10-19", "30m")
+    assert session.calls
+    assert all(call["params"]["timeframe"] == "30Min" for call in session.calls)
+    starts = [pd.Timestamp(call["params"]["start"]).tz_convert("America/New_York") for call in session.calls]
+    ends = [pd.Timestamp(call["params"]["end"]).tz_convert("America/New_York") for call in session.calls]
+    assert [stamp.strftime("%Y-%m-%d %H:%M") for stamp in starts] == ["2026-10-16 09:30"]
+    assert all(stamp.hour < 16 for stamp in ends)
+    assert all(stamp.date().weekday() < 5 for stamp in starts)
+    labels = [stamp.tz_convert("America/New_York").strftime("%H:%M") for stamp in frame.index]
+    assert labels == ["09:30", "15:30"]
+
+
+def test_early_close_request_ends_at_1300(monkeypatch):
+    pages = {None: {"bars": {"AAPL": []}, "next_page_token": None}}
+    provider, session = _provider(monkeypatch, pages)
+    provider.get_bars("AAPL", "2025-11-28", "2025-11-29", "30m")
+    assert len(session.calls) == 1
+    end = pd.Timestamp(session.calls[0]["params"]["end"]).tz_convert("America/New_York")
+    start = pd.Timestamp(session.calls[0]["params"]["start"]).tz_convert("America/New_York")
+    assert start.strftime("%H:%M") == "09:30"
+    assert end.hour == 12 and end.minute == 59

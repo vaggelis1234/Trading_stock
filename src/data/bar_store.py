@@ -10,6 +10,7 @@ no bar.
 import logging
 import os
 import sqlite3
+from datetime import date
 from typing import Optional
 
 import pandas as pd
@@ -396,6 +397,10 @@ class BarStore:
         stops before the next request and leaves stored bars in place.
         """
         _raise_if_sync_stopped(stop_check)
+        if interval == "30m":
+            removed = self.drop_bars_outside_cash_session()
+            if removed:
+                logger.info("dropped %s 30m bars outside the cash session", removed)
         if not hasattr(provider, "get_bars_many"):
             for symbol in symbols:
                 _raise_if_sync_stopped(stop_check)
@@ -616,7 +621,109 @@ class BarStore:
                 return True
         return False
 
+    def delete_30m_days(self, dates: list[date]) -> int:
+        """Delete 30-minute bars that fall on the given New York dates."""
+        return self._delete_interval_days(dates, "30m")
+
+    def delete_1d_days(self, dates: list[date]) -> int:
+        """Delete daily bars that fall on the given New York dates."""
+        return self._delete_interval_days(dates, "1d")
+
+    def _delete_interval_days(self, dates: list[date], interval: str) -> int:
+        """Delete bars in one interval. Coverage follows whatever remains."""
+        spans = []
+        for day in dict.fromkeys(dates):
+            start = pd.Timestamp(day, tz="America/New_York")
+            spans.append((_utc_iso(start), _utc_iso(start + pd.Timedelta(days=1))))
+        if not spans:
+            return 0
+        conn = self._connect()
+        try:
+            conn.execute("BEGIN")
+            removed = 0
+            for start, end in spans:
+                cursor = conn.execute(
+                    """DELETE FROM market_bars
+                       WHERE interval = ? AND bar_timestamp >= ? AND bar_timestamp < ?""",
+                    (interval, start, end),
+                )
+                removed += cursor.rowcount
+            if removed:
+                self._refresh_interval_coverage(conn, interval)
+            conn.commit()
+            return removed
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+
+    def _refresh_interval_coverage(self, conn: sqlite3.Connection, interval: str) -> None:
+        rows = conn.execute(
+            "SELECT symbol, latest_bar FROM market_coverage WHERE interval = ?",
+            (interval,),
+        ).fetchall()
+        for row in rows:
+            bounds = conn.execute(
+                """SELECT MIN(bar_timestamp) AS first, MAX(bar_timestamp) AS last
+                   FROM market_bars WHERE symbol = ? AND interval = ?""",
+                (row["symbol"], interval),
+            ).fetchone()
+            if bounds["first"] is None:
+                conn.execute(
+                    "DELETE FROM market_coverage WHERE symbol = ? AND interval = ?",
+                    (row["symbol"], interval),
+                )
+                continue
+            latest = bounds["last"]
+            checked = latest if row["latest_bar"] != latest else None
+            window_start = _as_utc(bounds["first"]).strftime("%Y-%m-%d")
+            if checked is None:
+                conn.execute(
+                    """UPDATE market_coverage
+                       SET window_start = ?, latest_bar = ?
+                       WHERE symbol = ? AND interval = ?""",
+                    (window_start, latest, row["symbol"], interval),
+                )
+            else:
+                conn.execute(
+                    """UPDATE market_coverage
+                       SET window_start = ?, checked_through = ?, latest_bar = ?
+                       WHERE symbol = ? AND interval = ?""",
+                    (window_start, checked, latest, row["symbol"], interval),
+                )
+
+    def drop_bars_outside_cash_session(self) -> int:
+        """Delete stored 30-minute bars that sit outside the official cash session."""
+        from src.data.scan_windows import inside_cash_session_30m
+        from src.market.calendar import NyseCalendar
+
+        calendar = NyseCalendar()
+        conn = self._connect()
+        try:
+            rows = conn.execute(
+                "SELECT symbol, bar_timestamp FROM market_bars WHERE interval = '30m'"
+            ).fetchall()
+            doomed = [
+                (row["symbol"], row["bar_timestamp"])
+                for row in rows
+                if not inside_cash_session_30m(row["bar_timestamp"], calendar)
+            ]
+            if doomed:
+                conn.executemany(
+                    "DELETE FROM market_bars WHERE symbol = ? AND interval = '30m' AND bar_timestamp = ?",
+                    doomed,
+                )
+                conn.commit()
+            return len(doomed)
+        finally:
+            conn.close()
+
     def _persist(self, symbol, interval, frame, required_start, clock, replace_all: bool) -> None:
+        if interval == "30m":
+            from src.data.scan_windows import cash_session_30m
+
+            frame = cash_session_30m(frame)
         rows = []
         if frame is not None and not frame.empty:
             for ts, row in frame.iterrows():
@@ -689,6 +796,121 @@ class BarStore:
             raise
         finally:
             conn.close()
+
+    def upsert_30m(self, symbol: str, frame, clock) -> int:
+        """Insert cash-session 30-minute bars without removing other sessions.
+
+        Coverage grows backward when the new day is older. ``checked_through``
+        moves only when these bars are newer than the stored tail, so an older
+        day does not mark today's tail as already refreshed.
+        """
+        from src.data.scan_windows import cash_session_30m
+
+        frame = cash_session_30m(frame)
+        if frame is None or frame.empty:
+            return 0
+        rows = []
+        for ts, row in frame.iterrows():
+            rows.append(
+                (
+                    symbol,
+                    "30m",
+                    _utc_iso(ts),
+                    _number(row["open"]),
+                    _number(row["high"]),
+                    _number(row["low"]),
+                    _number(row["close"]),
+                    _number(row["volume"]),
+                )
+            )
+        new_start = _as_utc(frame.index.min()).strftime("%Y-%m-%d")
+        new_latest = max(row[2] for row in rows)
+        conn = self._connect()
+        try:
+            conn.execute("BEGIN")
+            conn.executemany(_BAR_UPSERT, rows)
+            existing = conn.execute(
+                """SELECT window_start, checked_through, latest_bar FROM market_coverage
+                   WHERE symbol = ? AND interval = '30m'""",
+                (symbol,),
+            ).fetchone()
+            if existing is None:
+                window_start = new_start
+                checked = _utc_iso(clock)
+                latest = new_latest
+            else:
+                window_start = min(existing["window_start"], new_start)
+                latest = existing["latest_bar"] or new_latest
+                if new_latest > latest:
+                    latest = new_latest
+                checked = existing["checked_through"]
+                if latest == new_latest and new_latest != existing["latest_bar"]:
+                    checked = _utc_iso(clock)
+            conn.execute(
+                _COVERAGE_UPSERT,
+                (symbol, "30m", window_start, checked, latest),
+            )
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+        return len(rows)
+
+    def upsert_1d(self, symbol: str, frame, clock) -> int:
+        """Insert daily bars without removing other sessions."""
+        frame = prepare_ohlcv(frame)
+        if frame.empty:
+            return 0
+        rows = []
+        for ts, row in frame.iterrows():
+            rows.append(
+                (
+                    symbol,
+                    "1d",
+                    _utc_iso(ts),
+                    _number(row["open"]),
+                    _number(row["high"]),
+                    _number(row["low"]),
+                    _number(row["close"]),
+                    _number(row["volume"]),
+                )
+            )
+        new_start = _as_utc(frame.index.min()).strftime("%Y-%m-%d")
+        new_latest = max(row[2] for row in rows)
+        conn = self._connect()
+        try:
+            conn.execute("BEGIN")
+            conn.executemany(_BAR_UPSERT, rows)
+            existing = conn.execute(
+                """SELECT window_start, checked_through, latest_bar FROM market_coverage
+                   WHERE symbol = ? AND interval = '1d'""",
+                (symbol,),
+            ).fetchone()
+            if existing is None:
+                window_start = new_start
+                checked = _utc_iso(clock)
+                latest = new_latest
+            else:
+                window_start = min(existing["window_start"], new_start)
+                latest = existing["latest_bar"] or new_latest
+                if new_latest > latest:
+                    latest = new_latest
+                checked = existing["checked_through"]
+                if latest == new_latest and new_latest != existing["latest_bar"]:
+                    checked = _utc_iso(clock)
+            conn.execute(
+                _COVERAGE_UPSERT,
+                (symbol, "1d", window_start, checked, latest),
+            )
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+        return len(rows)
 
     def load_window(self, symbol: str, interval: str, required_start: str, required_end: str) -> pd.DataFrame:
         """Bars inside the evaluation window only.

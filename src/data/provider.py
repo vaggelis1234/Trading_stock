@@ -120,10 +120,12 @@ def batch_size_for_window(interval: str, start: str, end: str) -> int:
     """How many symbols share one request without exceeding one full page.
 
     ``1d`` counts calendar days in the requested window. ``1h`` counts hours.
-    ``30m`` counts 30-minute bars. The page limit is 10_000 bars across every
-    symbol, so the batch is ``10000 / bars per symbol``, and never above
-    ``ALPACA_SYMBOL_BATCH_CAP``.
+    ``30m`` is one cash session of at most 13 bars, so the batch stays at
+    ``ALPACA_SYMBOL_BATCH_CAP`` instead of shrinking with the calendar span.
+    The page limit is 10_000 bars across every symbol.
     """
+    if interval == "30m":
+        return ALPACA_SYMBOL_BATCH_CAP
     start_ts = _bound(start)
     end_ts = _bound(end)
     span_seconds = max(0.0, (end_ts - start_ts).total_seconds())
@@ -131,8 +133,6 @@ def batch_size_for_window(interval: str, start: str, end: str) -> int:
         max_bars = max(1, math.ceil(span_seconds / 86400))
     elif interval == "1h":
         max_bars = max(1, math.ceil(span_seconds / 3600))
-    elif interval == "30m":
-        max_bars = max(1, math.ceil(span_seconds / 1800))
     elif interval == "1m":
         max_bars = max(1, math.ceil(span_seconds / 60))
     else:
@@ -254,6 +254,11 @@ class AlpacaMarketDataProvider:
         start_ts = _bound(start)
         end_ts = _bound(end)
         symbol_text = str(symbol).strip()
+        if interval == "30m":
+            batch = self.get_bars_many([symbol_text], start, end, interval)
+            if symbol_text in batch.failed or symbol_text not in batch.frames:
+                raise requests.HTTPError("HTTP 400")
+            return batch.frames[symbol_text]
         outcome = self._attempt([symbol_text], timeframe, start_ts, end_ts)
         if outcome.kind != "ok" or outcome.batch is None:
             raise requests.HTTPError(f"HTTP {outcome.status}")
@@ -275,15 +280,39 @@ class AlpacaMarketDataProvider:
         ordered = list(dict.fromkeys(str(symbol).strip() for symbol in symbols if str(symbol).strip()))
         if not ordered:
             return BarsBatch({})
+        windows = _cash_session_windows(start_ts, end_ts) if interval == "30m" else [(start_ts, end_ts)]
+        if interval == "30m" and not windows:
+            return BarsBatch({symbol: prepare_ohlcv(None) for symbol in ordered})
+        pieces: dict[str, list[pd.DataFrame]] = {}
+        failed: set[str] = set()
+        for window_start, window_end in windows:
+            size = batch_size_for_window(interval, window_start.isoformat(), window_end.isoformat())
+            for offset in range(0, len(ordered), size):
+                chunk = ordered[offset:offset + size]
+                finished = self._finish(
+                    chunk,
+                    self._attempt(chunk, timeframe, window_start, window_end),
+                    timeframe,
+                    window_start,
+                    window_end,
+                )
+                failed.update(finished.failed)
+                for symbol, frame in finished.frames.items():
+                    if symbol in failed or frame is None or frame.empty:
+                        continue
+                    pieces.setdefault(symbol, []).append(frame)
         frames: dict[str, pd.DataFrame] = {}
-        failed: list[str] = []
-        size = batch_size_for_window(interval, start, end)
-        for offset in range(0, len(ordered), size):
-            chunk = ordered[offset:offset + size]
-            finished = self._finish(chunk, self._attempt(chunk, timeframe, start_ts, end_ts), timeframe, start_ts, end_ts)
-            frames.update(finished.frames)
-            failed.extend(finished.failed)
-        return BarsBatch(frames, tuple(failed))
+        for symbol in ordered:
+            if symbol in failed:
+                continue
+            parts = pieces.get(symbol, [])
+            if not parts:
+                frames[symbol] = prepare_ohlcv(None)
+                continue
+            merged = pd.concat(parts)
+            merged = merged[~merged.index.duplicated(keep="last")].sort_index()
+            frames[symbol] = merged
+        return BarsBatch(frames, tuple(symbol for symbol in ordered if symbol in failed))
 
     def _require_credentials(self) -> None:
         if not self._api_key or not self._api_secret:
@@ -330,6 +359,10 @@ class AlpacaMarketDataProvider:
 
     def _load_rows(self, symbols: list[str], timeframe: str, start: pd.Timestamp, end: pd.Timestamp) -> dict[str, list]:
         request_end = _sip_request_end(end)
+        if timeframe == "30Min" and request_end >= end:
+            # Alpaca treats ``end`` as inclusive. A 30-minute bar is stamped at
+            # its start, so the exclusive session close must not be requested.
+            request_end = end - pd.Timedelta(microseconds=1)
         collected = {symbol: [] for symbol in symbols}
         if start >= request_end:
             return collected
@@ -423,6 +456,37 @@ def _http_status(exc: BaseException) -> Optional[int]:
     response = getattr(exc, "response", None)
     status = getattr(response, "status_code", None)
     return status if isinstance(status, int) else None
+
+
+def _cash_session_windows(start: pd.Timestamp, end: pd.Timestamp) -> list[tuple[pd.Timestamp, pd.Timestamp]]:
+    """Half-open cash sessions that overlap ``[start, end)``.
+
+    Alpaca has no regular-hours filter. A 30-minute request uses one of these
+    windows so premarket and after-close bars are never asked for. Weekends
+    and holidays are skipped. An early close ends at 13:00 ET.
+    """
+    from src.market.calendar import NyseCalendar
+
+    from datetime import timedelta
+
+    calendar = NyseCalendar()
+    start_et = start.tz_convert("America/New_York")
+    end_et = end.tz_convert("America/New_York")
+    day = start_et.date()
+    last = end_et.date()
+    windows: list[tuple[pd.Timestamp, pd.Timestamp]] = []
+    while day <= last:
+        session = calendar.session(day)
+        if session is not None:
+            midnight = pd.Timestamp(day, tz="America/New_York")
+            open_at = midnight + pd.Timedelta(hours=9, minutes=30)
+            close_at = midnight + pd.Timedelta(hours=session.close_et.hour, minutes=session.close_et.minute)
+            lo = max(open_at, start_et)
+            hi = min(close_at, end_et)
+            if lo < hi:
+                windows.append((lo.tz_convert("UTC"), hi.tz_convert("UTC")))
+        day += timedelta(days=1)
+    return windows
 
 
 def _clip_bars(rows: list, start: pd.Timestamp, end: pd.Timestamp) -> pd.DataFrame:

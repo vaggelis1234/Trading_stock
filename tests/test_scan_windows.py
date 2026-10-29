@@ -158,6 +158,25 @@ def test_session_filter_keeps_0930_and_1530_and_drops_extended_hours():
 def test_thirty_minute_requests_stay_on_the_historical_sip_timeframe():
     assert _ALPACA_TIMEFRAMES["30m"] == "30Min"
     assert batch_size_for_window("30m", "2026-10-19T14:00:00Z", "2026-10-19T16:00:00Z") == 50
+    assert batch_size_for_window("30m", "2026-08-30T00:00:00Z", "2026-10-29T00:00:00Z") == 50
+
+
+def test_cash_session_30m_drops_premarket_and_after_close():
+    from src.data.scan_windows import cash_session_30m
+
+    frame = _bars(
+        DAY,
+        [
+            ("04:00", 1, 1),
+            ("09:00", 2, 2),
+            ("09:30", 100, 10),
+            ("15:30", 11, 22),
+            ("16:00", 999, 30),
+        ],
+    )
+    kept = cash_session_30m(frame)
+    labels = [stamp.tz_convert(NY).strftime("%H:%M") for stamp in kept.index]
+    assert labels == ["09:30", "15:30"]
 
 
 def test_a_missing_slot_bar_does_not_fall_back_to_the_previous_hour(tmp_path):

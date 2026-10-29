@@ -236,6 +236,34 @@ def _on_half_grid(et: pd.Timestamp) -> bool:
     return et.minute in (0, 30) and et.second == 0 and et.microsecond == 0 and et.nanosecond == 0
 
 
+def inside_cash_session_30m(timestamp, calendar: Optional[NyseCalendar] = None) -> bool:
+    """True when ``timestamp`` is the start of a 30-minute cash-session bar."""
+    calendar = calendar or NyseCalendar()
+    try:
+        return _inside_cash_session(timestamp, calendar)
+    except (TypeError, ValueError):
+        return False
+
+
+def cash_session_30m(frame: pd.DataFrame, calendar: Optional[NyseCalendar] = None) -> pd.DataFrame:
+    """Keep ``30Min`` bars whose whole window sits inside the official cash session.
+
+    The bar that starts at the session close is excluded. Premarket and
+    after-hours bars are excluded. This does not apply the SIP delay; scoring
+    still uses :func:`regular_completed_30m` for that.
+    """
+    from src.data.provider import prepare_ohlcv
+
+    prepared = prepare_ohlcv(frame)
+    if prepared.empty:
+        return prepared
+    calendar = calendar or NyseCalendar()
+    kept = [stamp for stamp in prepared.index if _inside_cash_session(stamp, calendar)]
+    if not kept:
+        return prepare_ohlcv(None)
+    return prepared.loc[kept]
+
+
 def regular_completed_30m(frame: pd.DataFrame, as_of, calendar: Optional[NyseCalendar] = None) -> pd.DataFrame:
     """Keep completed regular-session ``30Min`` bars. The close bar stays out.
 
@@ -246,7 +274,7 @@ def regular_completed_30m(frame: pd.DataFrame, as_of, calendar: Optional[NyseCal
     """
     from src.data.provider import prepare_ohlcv
 
-    prepared = prepare_ohlcv(frame)
+    prepared = cash_session_30m(frame, calendar)
     if prepared.empty:
         return prepared
     as_of_utc, naive = _as_utc(as_of)
@@ -256,19 +284,23 @@ def regular_completed_30m(frame: pd.DataFrame, as_of, calendar: Optional[NyseCal
     kept = []
     for stamp in prepared.index:
         et = pd.Timestamp(stamp).tz_convert(NEW_YORK)
-        if not _on_half_grid(et):
-            continue
-        session = calendar.session(et.date())
-        if session is None:
-            continue
-        open_at = et.normalize() + pd.Timedelta(hours=9, minutes=30)
-        close_at = et.normalize() + pd.Timedelta(hours=session.close_et.hour, minutes=session.close_et.minute)
         window_end = et + THIRTY_MINUTES
-        if et < open_at or window_end > close_at:
-            continue
         if as_of_utc < window_end.tz_convert("UTC") + SIP_RECENT_DELAY:
             continue
         kept.append(stamp)
     if not kept:
         return prepare_ohlcv(None)
     return prepared.loc[kept]
+
+
+def _inside_cash_session(stamp, calendar: NyseCalendar) -> bool:
+    et = pd.Timestamp(stamp).tz_convert(NEW_YORK)
+    if not _on_half_grid(et):
+        return False
+    session = calendar.session(et.date())
+    if session is None:
+        return False
+    open_at = et.normalize() + pd.Timedelta(hours=9, minutes=30)
+    close_at = et.normalize() + pd.Timedelta(hours=session.close_et.hour, minutes=session.close_et.minute)
+    window_end = et + THIRTY_MINUTES
+    return open_at <= et and window_end <= close_at
