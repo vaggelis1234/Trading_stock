@@ -589,6 +589,33 @@ def test_stop_during_scan_does_not_arm_the_scheduler(tmp_path):
         service.stop()
 
 
+def test_pause_holds_the_scan_until_resume_or_stop(tmp_path):
+    entered = threading.Event()
+    finished = threading.Event()
+
+    def initial():
+        entered.set()
+        deadline = time.time() + 2
+        while time.time() < deadline:
+            if service._should_stop():
+                raise UniverseScanStopped("universe scan stopped")
+            time.sleep(0.01)
+        finished.set()
+
+    service = _service(tmp_path, parse_args([]), initial_scan=initial)
+    worker = threading.Thread(target=service.start)
+    worker.start()
+    assert entered.wait(2)
+    assert service.toggle_pause() is True
+    time.sleep(0.3)
+    assert not finished.is_set()
+    assert worker.is_alive()
+    assert service.toggle_pause() is False
+    assert finished.wait(2)
+    worker.join(2)
+    service.stop()
+
+
 def test_stop_button_stops_universe_and_leaves_the_window_open():
     root = tk.Tk()
     root.withdraw()
@@ -629,7 +656,6 @@ def test_stop_button_stops_universe_and_leaves_the_window_open():
         app.worker.join(2)
         assert not app.worker.is_alive()
         assert app.root.winfo_exists()
-        assert int(app.progress["maximum"]) == 100
     finally:
         app.close()
 
@@ -652,20 +678,27 @@ def test_stopped_scan_reports_zero_and_does_not_finish(tmp_path):
     assert seen == [0]
 
 
-def test_progress_bar_shows_the_universe_percent():
+def test_action_button_fills_with_completed_work():
+    from tkinter import ttk
+
+    from src.desktop.calendar_panel import completion_percent
+
     root = tk.Tk()
     root.withdraw()
     app = TradingBotApp(root, service_factory=lambda *args, **kwargs: None)
     try:
-        assert int(app.progress["value"]) == 0
-        assert app.percent_var.get() == "0"
-        assert app.progress.master.cget("text") == "Universe"
-        assert str(app.activity.winfo_parent()).startswith(str(app.progress.master))
+        universe = app.activity.master.master
+        assert universe.cget("text") == "Universe"
+        assert not any(isinstance(child, ttk.Progressbar) for child in universe.winfo_children())
+        assert completion_percent(1, 4) == 25
+        app._arm_progress(app.start_button)
         app._set_progress(35)
-        assert int(app.progress["value"]) == 35
-        assert app.percent_var.get() == "35"
+        assert app.start_button.percent == 35
+        assert app.calendar.delete_button.percent == 0
         app._set_progress(140)
-        assert int(app.progress["value"]) == 100
+        assert app.start_button.percent == 100
+        app._clear_progress()
+        assert app.start_button.percent == 0
     finally:
         app.close()
 
