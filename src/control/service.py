@@ -60,6 +60,7 @@ class ControlService:
         self.universe_running = False
         self._scan_lock = threading.Lock()
         self._stop = threading.Event()
+        self._paused = threading.Event()
         self._scheduler = None
         self._stop_feed = None
         self._started = False
@@ -74,6 +75,7 @@ class ControlService:
         self._started = True
         self._released = False
         self._stop.clear()
+        self._paused.clear()
         self._emit(f"Buy permission: {self.options.buy_permission}. Trading execution: {trading_state(self.options.buy_permission).trading_execution}.")
         self._publish()
         try:
@@ -94,9 +96,26 @@ class ControlService:
         """Ask the worker to exit without releasing the process lock yet."""
         self.stop(release=False)
 
+    def toggle_pause(self) -> bool:
+        """Hold the scan between steps. A second call lets it continue."""
+        if self._paused.is_set():
+            self._paused.clear()
+            self._emit("Universe scan resumed")
+            return False
+        self._paused.set()
+        self._emit("Universe scan paused")
+        return True
+
+    def _should_stop(self) -> bool:
+        """True after stop. While paused, the caller waits here instead of ending."""
+        while self._paused.is_set() and not self._stop.is_set():
+            self._stop.wait(0.2)
+        return self._stop.is_set()
+
     def stop(self, *, release: bool = True) -> None:
         """Stop the clock and the feed. The lock stays until the worker finishes."""
         self._stop.set()
+        self._paused.clear()
         with self._state_lock:
             scheduler = self._scheduler
             self._scheduler = None
@@ -138,7 +157,7 @@ class ControlService:
         became due during the initial scan is classified only when that scan
         is done. A slot outside its grace window is not replayed.
         """
-        if self._stop.is_set():
+        if self._stop.is_set() or self._paused.is_set():
             return
         with self._scan_lock:
             if self._stop.is_set():
@@ -227,7 +246,7 @@ class ControlService:
                     db_path=DB_PATH,
                     artifact_dir=ARTIFACT_DIR,
                     now=now,
-                    stop_check=self._stop.is_set,
+                    stop_check=self._should_stop,
                     progress=self._report_progress,
                 )
             except UniverseScanStopped:
@@ -295,7 +314,7 @@ class ControlService:
     def _production_initial_scan(self):
         from scripts.scheduler import run_standalone_universe
 
-        return run_standalone_universe(stop_check=self._stop.is_set, progress=self._report_progress)
+        return run_standalone_universe(stop_check=self._should_stop, progress=self._report_progress)
 
     def _report_progress(self, percent: int) -> None:
         if self.on_progress is not None:
