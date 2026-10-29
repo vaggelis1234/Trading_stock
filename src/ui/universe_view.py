@@ -8,7 +8,6 @@ import pandas as pd
 from src.market.calendar import NyseCalendar
 from src.universe.metrics import to_utc_iso
 from src.universe.schedule import FINAL, SLOT_GRACE, as_new_york, session_slots
-from src.universe.ranking import TOP_N  # re-exported; the API read models import it from here
 from src.universe.veto import (
     ADV20_MIN,
     ATR_PERCENT_MAX,
@@ -105,13 +104,7 @@ def metric_display_value(row: Mapping, metric: str):
     return number
 
 
-def _slots_for(session, interval: str = "30m"):
-    """Universe history uses the 30-minute cash-session clock."""
-    del interval
-    return session_slots(session)
-
-
-def expected_snapshot_timestamps(anchor, range_key: str = DEFAULT_HISTORY_RANGE, interval: str = "30m") -> list[str]:
+def expected_snapshot_timestamps(anchor, range_key: str = DEFAULT_HISTORY_RANGE) -> list[str]:
     """30-minute window starts that should already be stored, oldest first.
 
     A regular cash day has thirteen windows from 09:30 through 15:30–16:00,
@@ -128,7 +121,7 @@ def expected_snapshot_timestamps(anchor, range_key: str = DEFAULT_HISTORY_RANGE,
     while day <= last:
         session = calendar.session(day)
         if session is not None:
-            for slot in _slots_for(session, interval):
+            for slot in session_slots(session):
                 window_start = slot.window_start.tz_convert("UTC")
                 if window_start < start:
                     continue
@@ -139,14 +132,14 @@ def expected_snapshot_timestamps(anchor, range_key: str = DEFAULT_HISTORY_RANGE,
     return stamps
 
 
-def snapshot_window_start(value, interval: str = "30m") -> Optional[str]:
+def snapshot_window_start(value) -> Optional[str]:
     """30-minute session window a stored snapshot belongs to.
 
     A scan clock within five minutes after its ready time still belongs to
     the window that just closed. Times outside the cash session return None.
     """
     ny = as_new_york(_as_utc(value))
-    slots = _slots_for(NyseCalendar().session(ny.date()), interval)
+    slots = session_slots(NyseCalendar().session(ny.date()))
     if not slots:
         return None
     for slot in slots:
@@ -167,7 +160,7 @@ def _as_utc(value) -> pd.Timestamp:
     return stamp.tz_convert("UTC")
 
 
-def metric_coverage(rows: Sequence[Mapping], metric: str, anchor, range_key: str = DEFAULT_HISTORY_RANGE, interval: str = "30m") -> dict:
+def metric_coverage(rows: Sequence[Mapping], metric: str, anchor, range_key: str = DEFAULT_HISTORY_RANGE) -> dict:
     """Compare stored snapshots with the session windows the range should hold.
 
     ``expected`` is one timestamp per window, its left edge in UTC. ``actual``
@@ -175,11 +168,11 @@ def metric_coverage(rows: Sequence[Mapping], metric: str, anchor, range_key: str
     is a covered window whose value for this metric is null. Several stored
     rows in one window count as one bar; the row nearest the window start wins.
     """
-    expected = expected_snapshot_timestamps(anchor, range_key, interval)
+    expected = expected_snapshot_timestamps(anchor, range_key)
     expected_set = set(expected)
     covered: dict[str, tuple[pd.Timestamp, Mapping]] = {}
     for row in rows:
-        window = snapshot_window_start(row["scan_timestamp"], interval)
+        window = snapshot_window_start(row["scan_timestamp"])
         if window is None or window not in expected_set:
             continue
         stored_at = _as_utc(row["scan_timestamp"])

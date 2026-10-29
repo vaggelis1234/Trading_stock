@@ -12,9 +12,9 @@ from typing import Any, Mapping, Optional, Sequence
 from src.persistence.store import SNAPSHOT_CURRENT, _parse_snapshot
 from src.ui.api.db import connect_readonly
 from src.data.company_names import company_name
+from src.universe.ranking import TOP_N
 from src.ui.universe_view import (
     METRIC_FIELDS,
-    TOP_N,
     display_status,
     history_start,
     metric_coverage,
@@ -76,10 +76,8 @@ def symbol_payload(path: str, symbol: str, range_key: str) -> dict[str, Any]:
             raise SymbolNotFound(symbol)
         since = history_start(current["scan_timestamp"], range_key)
         history = _symbol_history(connection, symbol, since)
-        interval = _known_interval(current.get("bar_interval"))
-        covered = [row for row in history if _known_interval(row.get("bar_interval")) == interval]
         coverage = {
-            name: metric_coverage(covered, name, current["scan_timestamp"], range_key, interval)
+            name: metric_coverage(history, name, current["scan_timestamp"], range_key)
             for name in METRIC_FIELDS
         }
         enrichment = _enrichment(connection, current["scan_timestamp"], symbol)
@@ -350,12 +348,6 @@ def _history_row(row: Mapping[str, Any]) -> dict[str, Any]:
         "atr_percent": _atr_points(row.get("atr_percent")),
         "volume_ratio": _number(row.get("volume_ratio")),
     }
-
-
-def _known_interval(value) -> str:
-    """Universe reads are 30-minute. The value is retained for the call sites."""
-    del value
-    return "30m"
 
 
 def _movement(rank, previous_rank) -> dict[str, Any]:

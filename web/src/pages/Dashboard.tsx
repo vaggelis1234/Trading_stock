@@ -42,7 +42,7 @@ export function Dashboard({ onOpen }: { onOpen: (symbol: string) => void }) {
         <div>
           <h1>Dashboard</h1>
           <p className="muted">
-            {`Market data ${formatNewYork(scan.scan_timestamp)} · 30-minute bars · Χρονική περίοδος (${formatNewYorkPeriod(scan.scan_timestamp, "30m")}) · Scan executed ${formatAthens(scan.executed_at)}`}
+            {`Market data ${formatNewYork(scan.scan_timestamp)} · 30-minute bars · Χρονική περίοδος (${formatNewYorkPeriod(scan.scan_timestamp)}) · Scan executed ${formatAthens(scan.executed_at)}`}
           </p>
         </div>
         <span className="pill">{snapshotLabel(scan.snapshot_kind)}</span>

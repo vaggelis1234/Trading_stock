@@ -105,14 +105,11 @@ describe("charts and snapshot roles", () => {
   });
 
   it("plots thirteen equal 30-minute slots", () => {
-    const half = sessionTimeSlots(
-      [
-        point("2026-10-19T13:30:00Z", 1),
-        point("2026-10-19T14:00:00Z", 2),
-        point("2026-10-19T19:30:00Z", 3),
-      ].map((item) => ({ ...item, interval: "30m" as const })),
-      "30m",
-    );
+    const half = sessionTimeSlots([
+      point("2026-10-19T13:30:00Z", 1),
+      point("2026-10-19T14:00:00Z", 2),
+      point("2026-10-19T19:30:00Z", 3),
+    ]);
     expect(half.map((slot) => slot.axisLabel)).toEqual([
       "9:30",
       "10:00",

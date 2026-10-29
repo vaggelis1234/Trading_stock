@@ -4,8 +4,6 @@ export interface ChartPoint {
   kind: "CURRENT" | "LOOKBACK" | null;
   /** ISO timestamp of the stored snapshot. Session charts ignore points without one. */
   at?: string;
-  /** Universe charts use completed 30-minute scans. */
-  interval?: "30m";
 }
 
 export interface PlottedPoint {
@@ -110,11 +108,10 @@ interface Bucket {
  * and last print of a day stays empty so the axis does not skip it. Several
  * prints in one window collapse to the one nearest the window start.
  */
-export function sessionTimeSlots(points: ChartPoint[], interval: "30m" = "30m"): TimeSlot[] {
+export function sessionTimeSlots(points: ChartPoint[]): TimeSlot[] {
   const windows = HALF_HOUR_WINDOWS;
-  const selected = points.filter((point) => (point.interval ?? interval) === "30m");
   const buckets = new Map<string, Bucket>();
-  for (const point of selected) {
+  for (const point of points) {
     if (!point.at) continue;
     const ny = nyParts(point.at);
     if (!ny) continue;
@@ -162,11 +159,10 @@ export function sessionTimeSlots(points: ChartPoint[], interval: "30m" = "30m"):
   return slots;
 }
 
-export function sessionWindowLabel(iso: string, interval: "30m" = "30m"): string {
+export function sessionWindowLabel(iso: string): string {
   const ny = nyParts(iso);
   if (!ny) return iso;
   const placed = classifyWindow(ny.minutes, HALF_HOUR_WINDOWS);
-  void interval;
   const window = placed?.window;
   const range = window ? `${window.label}–${pad(Math.floor(window.end / 60))}:${pad(window.end % 60)}` : "";
   const clock = window ? range : `${pad(ny.hour)}:${pad(ny.minute)}`;

@@ -14,11 +14,11 @@ describe("market clock labels", () => {
   });
 
   it("reads a 30-minute window only after its own SIP delay", () => {
-    expect(formatNewYorkPeriod("2026-10-19T14:14:00+00:00", "30m")).toBe("—");
-    expect(formatNewYorkPeriod("2026-10-19T14:15:00+00:00", "30m")).toBe("09:30-10:00");
-    expect(formatNewYorkPeriod("2026-10-19T17:33:00+00:00", "30m")).toBe("12:30-13:00");
-    expect(formatNewYorkPeriod("2026-10-19T20:14:00+00:00", "30m")).toBe("15:00-15:30");
-    expect(formatNewYorkPeriod("2026-10-19T20:15:00+00:00", "30m")).toBe("15:30-16:00");
+    expect(formatNewYorkPeriod("2026-10-19T14:14:00+00:00")).toBe("—");
+    expect(formatNewYorkPeriod("2026-10-19T14:15:00+00:00")).toBe("09:30-10:00");
+    expect(formatNewYorkPeriod("2026-10-19T17:33:00+00:00")).toBe("12:30-13:00");
+    expect(formatNewYorkPeriod("2026-10-19T20:14:00+00:00")).toBe("15:00-15:30");
+    expect(formatNewYorkPeriod("2026-10-19T20:15:00+00:00")).toBe("15:30-16:00");
   });
 
   it("advances the window only after the 15-minute SIP delay", () => {

@@ -21,15 +21,13 @@ const HALF_HOUR_WINDOWS: ReadonlyArray<readonly [number, number]> = Array.from({
   return [start, start + 30] as const;
 });
 
-export function formatNewYorkPeriod(value: string | null, interval: "30m" = "30m"): string {
+export function formatNewYorkPeriod(value: string | null): string {
   const parts = zonedParts(value, NEW_YORK);
   if (!parts) return "—";
   const clock = Number(parts.hour) * 60 + Number(parts.minute);
   if (!Number.isInteger(clock)) return "—";
-  void interval;
-  const windows = HALF_HOUR_WINDOWS;
   let ready: readonly [number, number] | null = null;
-  for (const sessionWindow of windows) {
+  for (const sessionWindow of HALF_HOUR_WINDOWS) {
     if (clock >= sessionWindow[1] + SIP_DELAY_MINUTES) ready = sessionWindow;
   }
   if (!ready) return "—";

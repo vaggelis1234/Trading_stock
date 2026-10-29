@@ -199,6 +199,5 @@ function toPoints(
     value: row[field],
     kind: row.snapshot_kind,
     at: row.scan_timestamp,
-    interval: "30m" as const,
   }));
 }
