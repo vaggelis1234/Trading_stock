@@ -45,6 +45,8 @@ SELECTED_BG = "#1d4f91"
 SELECTED_FG = "#ffffff"
 STORED_BG = "#143d2c"
 STORED_FG = "#b7f0cc"
+PARTIAL_BG = "#3d3014"
+PARTIAL_FG = "#f0d090"
 NORMAL_BG = "#1b2636"
 NORMAL_FG = "#d5deea"
 CLOSED_BG = "#121820"
@@ -287,9 +289,10 @@ class SessionCalendarPanel(ttk.LabelFrame):
             self.day_buttons[day] = button
             self._paint(day)
         if not self._running():
-            stored = sum(1 for info in self._catalog.values() if info.get("stored_symbols"))
+            complete = sum(1 for info in self._catalog.values() if info.get("complete"))
+            partial = sum(1 for info in self._catalog.values() if info.get("partial"))
             self.status_var.set(
-                f"{self._symbols} σύμβολα. {stored} συνεδρίες αυτού του μήνα είναι ήδη στη βάση."
+                f"{self._symbols} σύμβολα. {complete} συνεδρίες πλήρεις. {partial} με ελλιπή δεδομένα."
             )
         self._sync_download_button()
         self.apply_scale(self._scale, self._wraplength)
@@ -465,7 +468,7 @@ class SessionCalendarPanel(ttk.LabelFrame):
 
     def _day_text(self, day: date, info: dict) -> str:
         text = str(day.day)
-        if info.get("stored_symbols"):
+        if info.get("complete") or info.get("partial") or info.get("stored_symbols"):
             text += " •"
         return text
 
@@ -479,8 +482,11 @@ class SessionCalendarPanel(ttk.LabelFrame):
         if day in self.selected:
             button.configure(bg=SELECTED_BG, fg=SELECTED_FG)
             return
-        if info.get("stored_symbols"):
+        if info.get("complete"):
             button.configure(bg=STORED_BG, fg=STORED_FG)
+            return
+        if info.get("partial") or info.get("stored_symbols"):
+            button.configure(bg=PARTIAL_BG, fg=PARTIAL_FG)
             return
         button.configure(bg=NORMAL_BG, fg=NORMAL_FG)
 

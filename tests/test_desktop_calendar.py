@@ -6,7 +6,13 @@ import pytest
 
 from src.data.bar_store import BarStore
 from src.data.session_download import DownloadResult, calendar_session_dates, session_month
-from src.desktop.calendar_panel import SessionCalendarPanel, completion_percent, session_activity_line
+from src.desktop.calendar_panel import (
+    PARTIAL_BG,
+    STORED_BG,
+    SessionCalendarPanel,
+    completion_percent,
+    session_activity_line,
+)
 
 TODAY = date(2026, 10, 16)
 
@@ -39,6 +45,7 @@ def test_calendar_downloads_only_the_selected_market_days(tmp_path):
         assert str(panel.day_buttons[date(2026, 10, 17)].cget("state")) == "disabled"
         assert str(panel.day_buttons[date(2026, 10, 19)].cget("state")) == "disabled"
         assert "•" in panel.day_buttons[date(2026, 10, 14)].cget("text")
+        assert panel.day_buttons[date(2026, 10, 14)].cget("bg") == PARTIAL_BG
         panel.toggle(date(2026, 10, 16))
         panel.toggle(date(2026, 10, 14))
         panel.toggle(date(2026, 10, 17))
@@ -49,6 +56,31 @@ def test_calendar_downloads_only_the_selected_market_days(tmp_path):
         assert requested == [[date(2026, 10, 14), date(2026, 10, 16)]]
         assert notes == [session_activity_line("download", [date(2026, 10, 14), date(2026, 10, 16)])]
         assert panel.status_var.get() == "Αποθηκεύτηκαν 2 bars."
+    finally:
+        root.destroy()
+
+
+def test_complete_day_is_green_and_partial_day_is_amber():
+    tk = pytest.importorskip("tkinter")
+    root = tk.Tk()
+    root.withdraw()
+    panel = SessionCalendarPanel(
+        root,
+        today=TODAY,
+        load_month=lambda year, month, today: {
+            "days": [
+                {"date": "2026-10-14", "market": True, "close": "16:00", "stored_symbols": 2, "complete": True, "partial": False, "selectable": True},
+                {"date": "2026-10-16", "market": True, "close": "16:00", "stored_symbols": 2, "complete": False, "partial": True, "selectable": True},
+            ],
+            "symbols": 2,
+        },
+        download=lambda dates, on_progress=None: None,
+    )
+    try:
+        assert panel.day_buttons[date(2026, 10, 14)].cget("bg") == STORED_BG
+        assert panel.day_buttons[date(2026, 10, 16)].cget("bg") == PARTIAL_BG
+        assert "1 συνεδρίες πλήρεις" in panel.status_var.get()
+        assert "1 με ελλιπή δεδομένα" in panel.status_var.get()
     finally:
         root.destroy()
 
@@ -263,6 +295,60 @@ def test_sixty_day_delete_removes_the_same_sessions_as_the_download():
         assert str(app.pause_button.cget("state")) == "disabled"
         assert str(app.sixty_delete_button.cget("state")) == "normal"
     finally:
+        app.close()
+
+
+def test_scheduler_box_starts_the_clock_and_logs_the_next_scan():
+    tk = pytest.importorskip("tkinter")
+    from src.data.scan_scheduler import next_scan_message
+    from src.desktop.app import TradingBotApp
+
+    started = threading.Event()
+    release = threading.Event()
+
+    def scheduler(**kwargs):
+        kwargs["log"](next_scan_message("16:15:00", "09:30:00-10:00:00"))
+        started.set()
+        while not kwargs["should_stop"]() and not release.is_set():
+            release.wait(0.05)
+
+    root = tk.Tk()
+    root.withdraw()
+    app = TradingBotApp(
+        root,
+        load_month=lambda year, month, today: {"days": [], "symbols": 0},
+        scheduler=scheduler,
+        scheduler_symbols=lambda: ["AAPL"],
+    )
+    try:
+        assert app.scheduler_box.cget("text") == "Scheduler"
+        assert app.scheduler_button.cget("text") == "Εκκίνηση scheduler"
+        app.start_scheduler()
+
+        def see_next_scan():
+            text = app.activity.get("1.0", "end")
+            if "επόμενο scan 16:15:00 για την περίοδο [09:30:00-10:00:00]" in text:
+                assert str(app.scheduler_button.cget("state")) == "disabled"
+                app.stop_universe()
+                release.set()
+                app.root.after(20, wait_until_stopped)
+                return
+            app.root.after(20, see_next_scan)
+
+        def wait_until_stopped():
+            if app.worker is not None and app.worker.is_alive():
+                app.root.after(20, wait_until_stopped)
+                return
+            app.root.after(20, app.root.quit)
+
+        app.root.after(20, see_next_scan)
+        app.root.after(3000, app.root.quit)
+        app.root.mainloop()
+        assert "επόμενο scan 16:15:00 για την περίοδο [09:30:00-10:00:00]" in app.activity.get("1.0", "end")
+        assert app.activity.get("1.0", "end").count("ο scheduler σταμάτησε") == 1
+        assert str(app.scheduler_button.cget("state")) == "normal"
+    finally:
+        release.set()
         app.close()
 
 

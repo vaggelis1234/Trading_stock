@@ -22,12 +22,14 @@ from src.control.permissions import LaunchOptions, resolve_buy_permission
 from src.control.service import ControlService
 from src.control.status import current_status
 from src.data.provider import MarketDataUnavailable
+from src.data.scan_scheduler import SCAN_FINISHED, run_download_scheduler
 from src.data.session_download import (
     CALENDAR_LOOKBACK_DAYS,
     NoTrackedSymbols,
     calendar_session_dates,
     delete_sessions,
     download_calendar_days,
+    download_scan_window,
     ny_today,
 )
 
@@ -128,6 +130,30 @@ def _default_sixty_delete(dates):
     from src.data.bar_store import BarStore
 
     return delete_sessions(list(dates), store=BarStore())
+
+
+def _default_scheduler_symbols():
+    from scripts.scheduler import resolve_symbols
+
+    return resolve_symbols()
+
+
+def _default_slot_download(slot, symbols, should_stop=None, wait_if_paused=None):
+    """One scheduled window for the tracked universe. Does not score it."""
+    import pandas as pd
+
+    from src.data.bar_store import BarStore
+    from src.data.provider import AlpacaMarketDataProvider
+
+    return download_scan_window(
+        slot,
+        provider=AlpacaMarketDataProvider(),
+        store=BarStore(),
+        symbols=symbols,
+        clock=pd.Timestamp.now(tz="UTC"),
+        should_stop=should_stop,
+        wait_if_paused=wait_if_paused,
+    )
 
 
 def _default_sixty_download(dates, on_progress=None, should_stop=None, wait_if_paused=None):
@@ -284,7 +310,7 @@ def _panel_background(widget) -> str:
 
 
 class TradingBotApp:
-    def __init__(self, root: tk.Tk | None = None, service_factory=None, status_reader=None, web_opener=None, calendar_today=None, load_month=None, download_sessions=None, download_sixty=None, delete_sixty=None):
+    def __init__(self, root: tk.Tk | None = None, service_factory=None, status_reader=None, web_opener=None, calendar_today=None, load_month=None, download_sessions=None, download_sixty=None, delete_sixty=None, slot_download=None, scheduler_symbols=None, scheduler=None, scheduler_clock=None):
         self.root = root or tk.Tk()
         self.root.title("Trading Bot")
         self.service_factory = service_factory or ControlService
@@ -295,6 +321,10 @@ class TradingBotApp:
         self._download_sessions = download_sessions
         self._download_sixty = download_sixty or _default_sixty_download
         self._delete_sixty = delete_sixty or _default_sixty_delete
+        self._slot_download = slot_download or _default_slot_download
+        self._scheduler_symbols = scheduler_symbols or _default_scheduler_symbols
+        self._scheduler = scheduler or run_download_scheduler
+        self._scheduler_clock = scheduler_clock
         self._mode = None
         self._stop_download = threading.Event()
         self._pause_download = threading.Event()
@@ -380,17 +410,28 @@ class TradingBotApp:
         )
         self.note.grid(row=4, column=0, sticky="ew", pady=(0, 12))
 
+        scheduler_box = ttk.LabelFrame(frame, text="Scheduler", padding=8)
+        scheduler_box.grid(row=5, column=0, sticky="ew", pady=(0, 12))
+        scheduler_box.columnconfigure(0, weight=1)
+        self.scheduler_box = scheduler_box
+        self.scheduler_button = ttk.Button(
+            scheduler_box,
+            text="Εκκίνηση scheduler",
+            command=self.start_scheduler,
+        )
+        self.scheduler_button.grid(row=0, column=0, sticky="ew")
+
         buttons = ttk.Frame(frame)
-        buttons.grid(row=5, column=0, sticky="ew", pady=(0, 12))
+        buttons.grid(row=6, column=0, sticky="ew", pady=(0, 12))
         ttk.Button(buttons, text="HELP", command=self.show_help).grid(row=0, column=0, padx=(0, 8))
         ttk.Button(buttons, text="STATUS", command=self.show_status).grid(row=0, column=1, padx=(0, 8))
         ttk.Button(buttons, text="WEB UI", command=self.open_web_ui).grid(row=0, column=2)
 
         dialog = ttk.LabelFrame(frame, text="Universe", padding=8)
-        dialog.grid(row=6, column=0, sticky="nsew")
+        dialog.grid(row=7, column=0, sticky="nsew")
         dialog.columnconfigure(0, weight=1)
         dialog.rowconfigure(0, weight=1)
-        frame.rowconfigure(6, weight=1)
+        frame.rowconfigure(7, weight=1)
         self.activity = ScrolledText(
             dialog,
             height=8,
@@ -492,6 +533,18 @@ class TradingBotApp:
         self.worker = threading.Thread(target=self._run_service, args=(options,), name="trading-bot", daemon=False)
         self.worker.start()
 
+    def start_scheduler(self) -> None:
+        """Arm the session clock. Downloads run when each scan time arrives."""
+        if (self.worker is not None and self.worker.is_alive()) or self.calendar._running():
+            self._log("ο scheduler τρέχει ήδη" if self._mode == "scheduler" else "τρέχει ήδη λήψη")
+            return
+        self._mode = "scheduler"
+        self._stop_download.clear()
+        self._pause_download.clear()
+        self._set_running(True)
+        self.worker = threading.Thread(target=self._run_scheduler, name="bar-scheduler", daemon=True)
+        self.worker.start()
+
     def stop_universe(self) -> None:
         """Stop the running Universe scan and its scheduler. The window stays open."""
         if self._mode in ("sixty", "sessions"):
@@ -500,6 +553,15 @@ class TradingBotApp:
             self.stop_button.configure(state="disabled")
             self.pause_button.configure(state="disabled")
             self._log("η λήψη σταμάτησε")
+            return
+        if self._mode == "scheduler":
+            if self.worker is None or not self.worker.is_alive():
+                return
+            self._stop_download.set()
+            self._pause_download.clear()
+            self.stop_button.configure(state="disabled")
+            self.pause_button.configure(state="disabled")
+            self._log("ο scheduler σταμάτησε")
             return
         service = self.service
         if service is None or self.worker is None or not self.worker.is_alive():
@@ -520,19 +582,21 @@ class TradingBotApp:
 
     def pause_universe(self) -> None:
         """Hold the running scan, or let it continue if it is already paused."""
-        if self._mode in ("sixty", "sessions"):
+        if self._mode in ("sixty", "sessions", "scheduler"):
             if self._mode == "sixty" and (self.worker is None or not self.worker.is_alive()):
                 return
             if self._mode == "sessions" and not self.calendar._running():
                 return
+            if self._mode == "scheduler" and (self.worker is None or not self.worker.is_alive()):
+                return
             if self._pause_download.is_set():
                 self._pause_download.clear()
                 self.pause_button.set_paused(False)
-                self._log("η λήψη συνεχίζει")
+                self._log("ο scheduler συνεχίζει" if self._mode == "scheduler" else "η λήψη συνεχίζει")
             else:
                 self._pause_download.set()
                 self.pause_button.set_paused(True)
-                self._log("η λήψη σε παύση")
+                self._log("ο scheduler σε παύση" if self._mode == "scheduler" else "η λήψη σε παύση")
             return
         service = self.service
         if service is None or self.worker is None or not self.worker.is_alive():
@@ -597,7 +661,13 @@ class TradingBotApp:
                     service.stop()
             except Exception:
                 logger.exception("stop failed while closing the window")
-        self.root.destroy()
+        worker = self.worker
+        try:
+            self.root.destroy()
+        except tk.TclError:
+            return
+        if worker is not None and worker.is_alive() and worker is not threading.current_thread():
+            worker.join(5)
         if session_worker is not None and session_worker.is_alive():
             session_worker.join(5)
 
@@ -628,6 +698,56 @@ class TradingBotApp:
                 logger.exception("stop failed")
             self.service = None
             self._post(lambda: self._set_running(False))
+
+    def _run_scheduler(self) -> None:
+        try:
+            symbols = list(self._scheduler_symbols() or [])
+            if not symbols:
+                self._post(lambda: self._log("δεν υπάρχουν σύμβολα για λήψη"))
+                return
+
+            def download(slot):
+                return self._slot_download(
+                    slot,
+                    symbols,
+                    should_stop=self._download_should_stop,
+                    wait_if_paused=self._wait_if_download_paused,
+                )
+
+            def log(text: str) -> None:
+                def apply(text=text) -> None:
+                    self._log(text)
+                    if text == SCAN_FINISHED:
+                        self.calendar.show_month()
+
+                self._post(apply)
+
+            self._scheduler(
+                clock=self._scheduler_now,
+                download=download,
+                log=log,
+                should_stop=self._download_should_stop,
+                wait_if_paused=self._wait_if_download_paused,
+            )
+        except Exception as exc:
+            logger.exception("scheduler failed")
+            self._post(lambda exc=exc: self._log(f"ο scheduler σταμάτησε: {exc}"))
+        finally:
+            self._post(self._end_scheduler)
+
+    def _scheduler_now(self):
+        if self._scheduler_clock is not None:
+            return self._scheduler_clock()
+        import pandas as pd
+
+        return pd.Timestamp.now(tz="America/New_York")
+
+    def _end_scheduler(self) -> None:
+        if self._closed.is_set():
+            return
+        self._set_running(False)
+        if self._stop_download.is_set():
+            self._log("ο scheduler σταμάτησε", once=True)
 
     def _run_sixty(self, dates) -> None:
         try:
@@ -717,6 +837,7 @@ class TradingBotApp:
             self.pause_button.configure(state="normal" if running and controls else "disabled")
         self.scheduler_check.configure(state=state)
         self.watch_check.configure(state=state)
+        self.scheduler_button.configure(state=state)
         if running:
             self.buy_check.configure(state="disabled")
         else:
@@ -736,6 +857,7 @@ class TradingBotApp:
             self.sixty_delete_button.configure(state="disabled")
             self.pause_button.configure(state="normal")
             self.stop_button.configure(state="normal")
+            self.scheduler_button.configure(state="disabled")
             return
         if self._mode == "sessions":
             self._mode = None
@@ -745,6 +867,7 @@ class TradingBotApp:
         if self.worker is None or not self.worker.is_alive():
             self.start_button.configure(state="normal")
             self.sixty_delete_button.configure(state="normal")
+            self.scheduler_button.configure(state="normal")
 
     def _open_web_when_ready(self) -> None:
         try:
@@ -801,9 +924,11 @@ class TradingBotApp:
         button.set_progress(percent)
 
     def _post(self, callback) -> None:
+        if self._closed.is_set():
+            return
         try:
             self.root.after(0, callback)
-        except RuntimeError:
+        except (RuntimeError, tk.TclError):
             return
 
     def _append(self, message: str) -> None:

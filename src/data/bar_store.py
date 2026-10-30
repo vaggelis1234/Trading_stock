@@ -268,6 +268,14 @@ class BarStore:
                     PRIMARY KEY (symbol, interval)
                 )"""
             )
+            conn.execute(
+                """CREATE TABLE IF NOT EXISTS session_absence (
+                    symbol TEXT NOT NULL,
+                    session_date TEXT NOT NULL,
+                    interval TEXT NOT NULL,
+                    PRIMARY KEY (symbol, session_date, interval)
+                )"""
+            )
             _ensure_hourly_session_columns(conn)
             conn.commit()
         finally:
@@ -650,6 +658,11 @@ class BarStore:
                 removed += cursor.rowcount
             if removed:
                 self._refresh_interval_coverage(conn, interval)
+            for day in dict.fromkeys(dates):
+                conn.execute(
+                    "DELETE FROM session_absence WHERE session_date = ? AND interval = ?",
+                    (day.isoformat(), interval),
+                )
             conn.commit()
             return removed
         except Exception:
@@ -797,6 +810,43 @@ class BarStore:
         finally:
             conn.close()
 
+    def mark_session_absent(self, symbol: str, day: date, interval: str) -> None:
+        """Remember that a closed session was checked and the provider had no bars."""
+        conn = self._connect()
+        try:
+            conn.execute(
+                """INSERT INTO session_absence (symbol, session_date, interval)
+                   VALUES (?, ?, ?)
+                   ON CONFLICT(symbol, session_date, interval) DO NOTHING""",
+                (symbol, day.isoformat(), interval),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+    def session_absences(self, start: date, end: date) -> set[tuple[date, str, str]]:
+        """Confirmed empty sessions in ``[start, end)``, keyed by date, symbol, interval."""
+        conn = self._connect()
+        try:
+            rows = conn.execute(
+                """SELECT symbol, session_date, interval FROM session_absence
+                   WHERE session_date >= ? AND session_date < ?""",
+                (start.isoformat(), end.isoformat()),
+            ).fetchall()
+        finally:
+            conn.close()
+        return {(date.fromisoformat(row["session_date"]), row["symbol"], row["interval"]) for row in rows}
+
+    def _clear_session_absence(self, conn: sqlite3.Connection, symbol: str, interval: str, timestamps) -> None:
+        days = set()
+        for ts in timestamps:
+            days.add(_as_utc(ts).tz_convert("America/New_York").date().isoformat())
+        for day in days:
+            conn.execute(
+                "DELETE FROM session_absence WHERE symbol = ? AND session_date = ? AND interval = ?",
+                (symbol, day, interval),
+            )
+
     def upsert_30m(self, symbol: str, frame, clock) -> int:
         """Insert cash-session 30-minute bars without removing other sessions.
 
@@ -850,6 +900,7 @@ class BarStore:
                 _COVERAGE_UPSERT,
                 (symbol, "30m", window_start, checked, latest),
             )
+            self._clear_session_absence(conn, symbol, "30m", frame.index)
             conn.commit()
         except Exception:
             conn.rollback()
@@ -904,6 +955,7 @@ class BarStore:
                 _COVERAGE_UPSERT,
                 (symbol, "1d", window_start, checked, latest),
             )
+            self._clear_session_absence(conn, symbol, "1d", frame.index)
             conn.commit()
         except Exception:
             conn.rollback()

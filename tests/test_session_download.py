@@ -10,10 +10,12 @@ from src.data.session_download import (
     calendar_session_dates,
     delete_sessions,
     download_calendar_days,
+    download_scan_window,
     download_sessions,
     parse_sessions,
     session_month,
 )
+from src.universe.schedule import session_slots
 from src.market.calendar import NyseCalendar
 
 TODAY = date(2026, 10, 16)
@@ -90,16 +92,56 @@ def test_a_full_session_is_not_requested_again(tmp_path):
         clock=clock,
     )
     assert result.skipped == 1
-    assert result.bars == 4
+    assert result.bars == 2
     assert [
         pd.Timestamp(call["start"]).tz_convert("America/New_York").date() for call in provider.calls
     ] == [date(2026, 10, 16), date(2026, 10, 16)]
+    assert [call["symbols"] for call in provider.calls] == [["MSFT"], ["MSFT"]]
 
 
-def test_the_open_session_is_still_requested(tmp_path):
+def test_a_partial_day_requests_only_the_missing_symbols(tmp_path):
+    store = BarStore(str(tmp_path / "bars.db"))
+    clock = pd.Timestamp("2026-10-16 21:00", tz="UTC")
+    _store_closed_session(store, date(2026, 10, 14), clock, symbols=("AAPL",))
+    store.upsert_30m("MSFT", _bar(pd.Timestamp("2026-10-14 13:30", tz="UTC"), 4.0), clock)
+    provider = _Provider()
+    result = download_sessions(
+        [date(2026, 10, 14)],
+        provider=provider,
+        store=store,
+        symbols=["AAPL", "MSFT"],
+        clock=clock,
+    )
+    assert result.skipped == 0
+    assert [call["symbols"] for call in provider.calls] == [["MSFT"], ["MSFT"]]
+
+
+def test_a_complete_intraday_session_requests_only_the_missing_daily_bar(tmp_path):
+    store = BarStore(str(tmp_path / "bars.db"))
+    clock = pd.Timestamp("2026-10-16 21:00", tz="UTC")
+    start = pd.Timestamp(date(2026, 10, 14), tz="America/New_York") + pd.Timedelta(hours=9, minutes=30)
+    index = pd.DatetimeIndex([start + pd.Timedelta(minutes=30 * step) for step in range(13)])
+    frame = pd.DataFrame(
+        {"open": 10.0, "high": 11.0, "low": 9.0, "close": 10.5, "volume": 100.0},
+        index=index,
+    )
+    store.upsert_30m("AAPL", frame, clock)
+    provider = _Provider()
+    download_sessions(
+        [date(2026, 10, 14)],
+        provider=provider,
+        store=store,
+        symbols=["AAPL"],
+        clock=clock,
+    )
+    assert [call["interval"] for call in provider.calls] == ["1d"]
+    assert provider.calls[0]["symbols"] == ["AAPL"]
+
+
+def test_the_open_session_requests_only_symbols_missing_closed_bars(tmp_path):
     store = BarStore(str(tmp_path / "bars.db"))
     clock = pd.Timestamp("2026-10-16 15:00", tz="UTC")
-    _store_closed_session(store, date(2026, 10, 16), clock)
+    _store_closed_session(store, date(2026, 10, 16), clock, symbols=("AAPL",))
     provider = _Provider()
     result = download_sessions(
         [date(2026, 10, 16)],
@@ -109,7 +151,8 @@ def test_the_open_session_is_still_requested(tmp_path):
         clock=clock,
     )
     assert result.skipped == 0
-    assert provider.calls
+    assert [call["interval"] for call in provider.calls] == ["30m"]
+    assert provider.calls[0]["symbols"] == ["MSFT"]
 
 
 def test_calendar_marks_a_stored_session_and_disables_the_future(tmp_path):
@@ -123,6 +166,8 @@ def test_calendar_marks_a_stored_session_and_disables_the_future(tmp_path):
     by_date = {day["date"]: day for day in month["days"]}
     assert month["symbols"] == 1
     assert by_date["2026-10-16"]["stored_symbols"] == 1
+    assert by_date["2026-10-16"]["complete"] is False
+    assert by_date["2026-10-16"]["partial"] is True
     assert by_date["2026-10-16"]["selectable"] is True
     assert by_date["2026-10-17"]["market"] is False
     assert by_date["2026-10-19"]["selectable"] is False
@@ -215,6 +260,168 @@ def test_delete_sessions_removes_only_the_chosen_new_york_days(tmp_path):
     assert len(hourly) == 1
     assert store.coverage("MSFT", "30m") is None
     assert store.coverage("AAPL", "30m")["latest_bar"].startswith("2026-10-15")
+
+
+def test_a_symbol_the_provider_has_no_bars_for_does_not_keep_the_day_partial(tmp_path):
+    store = BarStore(str(tmp_path / "bars.db"))
+    clock = pd.Timestamp("2026-10-16 21:00", tz="UTC")
+    _store_closed_session(store, date(2026, 10, 14), clock, symbols=("AAPL",))
+    _store_closed_session(store, date(2026, 10, 15), clock, symbols=("VYLR",))
+    provider = _EmptyProvider()
+    download_sessions(
+        [date(2026, 10, 14)],
+        provider=provider,
+        store=store,
+        symbols=["AAPL", "VYLR"],
+        clock=clock,
+    )
+    day = _month_day(store, "2026-10-14")
+    assert day["complete"] is True
+    assert day["partial"] is False
+    assert [call["symbols"] for call in provider.calls] == [["VYLR"], ["VYLR"]]
+
+    again = _EmptyProvider()
+    result = download_sessions(
+        [date(2026, 10, 14)],
+        provider=again,
+        store=store,
+        symbols=["AAPL", "VYLR"],
+        clock=clock,
+    )
+    assert result.skipped == 1
+    assert again.calls == []
+
+
+def test_a_failed_symbol_stays_missing(tmp_path):
+    store = BarStore(str(tmp_path / "bars.db"))
+    clock = pd.Timestamp("2026-10-16 21:00", tz="UTC")
+    _store_closed_session(store, date(2026, 10, 14), clock, symbols=("AAPL",))
+    _store_closed_session(store, date(2026, 10, 15), clock, symbols=("VYLR",))
+    download_sessions(
+        [date(2026, 10, 14)],
+        provider=_Provider(failed=("VYLR",)),
+        store=store,
+        symbols=["AAPL", "VYLR"],
+        clock=clock,
+    )
+    assert _month_day(store, "2026-10-14")["partial"] is True
+    again = _Provider()
+    download_sessions(
+        [date(2026, 10, 14)],
+        provider=again,
+        store=store,
+        symbols=["AAPL", "VYLR"],
+        clock=clock,
+    )
+    assert [call["symbols"] for call in again.calls] == [["VYLR"], ["VYLR"]]
+
+
+def test_deleting_a_day_forgets_that_a_symbol_had_no_bars(tmp_path):
+    store = BarStore(str(tmp_path / "bars.db"))
+    clock = pd.Timestamp("2026-10-16 21:00", tz="UTC")
+    _store_closed_session(store, date(2026, 10, 14), clock, symbols=("AAPL",))
+    download_sessions(
+        [date(2026, 10, 14)],
+        provider=_EmptyProvider(),
+        store=store,
+        symbols=["AAPL", "VYLR"],
+        clock=clock,
+    )
+    delete_sessions([date(2026, 10, 14)], store=store)
+    again = _EmptyProvider()
+    download_sessions(
+        [date(2026, 10, 14)],
+        provider=again,
+        store=store,
+        symbols=["VYLR"],
+        clock=clock,
+    )
+    assert [call["symbols"] for call in again.calls] == [["VYLR"], ["VYLR"]]
+
+
+def test_an_open_session_does_not_treat_an_empty_reply_as_final(tmp_path):
+    store = BarStore(str(tmp_path / "bars.db"))
+    clock = pd.Timestamp("2026-10-16 15:00", tz="UTC")
+    provider = _EmptyProvider()
+    download_sessions(
+        [date(2026, 10, 16)],
+        provider=provider,
+        store=store,
+        symbols=["AAPL"],
+        clock=clock,
+    )
+    again = _EmptyProvider()
+    download_sessions(
+        [date(2026, 10, 16)],
+        provider=again,
+        store=store,
+        symbols=["AAPL"],
+        clock=clock,
+    )
+    assert [call["interval"] for call in again.calls] == ["30m"]
+
+
+def test_a_scan_window_downloads_that_period_and_skips_a_stored_bar(tmp_path):
+    store = BarStore(str(tmp_path / "bars.db"))
+    slot = session_slots(NyseCalendar().session(date(2026, 10, 16)))[0]
+    provider = _Provider()
+    result = download_scan_window(
+        slot,
+        provider=provider,
+        store=store,
+        symbols=["AAPL", "MSFT"],
+        clock=slot.scan_at,
+    )
+    assert result.bars == 2
+    assert len(provider.calls) == 1
+    assert provider.calls[0]["interval"] == "30m"
+    assert provider.calls[0]["symbols"] == ["AAPL", "MSFT"]
+    assert pd.Timestamp(provider.calls[0]["start"]) == slot.window_start
+    assert pd.Timestamp(provider.calls[0]["end"]) == slot.window_end
+    again = _Provider()
+    second = download_scan_window(
+        slot,
+        provider=again,
+        store=store,
+        symbols=["AAPL", "MSFT"],
+        clock=slot.scan_at,
+    )
+    assert again.calls == []
+    assert second.skipped == 1
+    assert second.bars == 0
+
+
+def test_the_final_scan_also_downloads_the_daily_bar(tmp_path):
+    store = BarStore(str(tmp_path / "bars.db"))
+    slot = session_slots(NyseCalendar().session(date(2026, 10, 16)))[-1]
+    store.upsert_30m("AAPL", _bar(slot.window_start, 10.0), slot.scan_at)
+    provider = _Provider()
+    result = download_scan_window(
+        slot,
+        provider=provider,
+        store=store,
+        symbols=["AAPL", "MSFT"],
+        clock=slot.scan_at,
+    )
+    assert result.bars == 3
+    assert [call["interval"] for call in provider.calls] == ["30m", "1d"]
+    assert provider.calls[0]["symbols"] == ["MSFT"]
+    assert provider.calls[1]["symbols"] == ["AAPL", "MSFT"]
+
+
+class _EmptyProvider:
+    def __init__(self):
+        self.calls = []
+
+    def get_bars_many(self, symbols, start, end, interval):
+        self.calls.append({"symbols": list(symbols), "start": start, "end": end, "interval": interval})
+        frame = pd.DataFrame(columns=["open", "high", "low", "close", "volume"])
+        return BarsBatch({symbol: frame for symbol in symbols})
+
+
+def _month_day(store, iso):
+    month = session_month(2026, 10, store, TODAY)
+    return next(day for day in month["days"] if day["date"] == iso)
 
 
 def _store_closed_session(store, day, clock, symbols=("AAPL", "MSFT")):
